@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any, Final
+from http import HTTPStatus
+from typing import Any, Final, Protocol
 
 from fastapi import Request
 
@@ -18,6 +19,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeChatRequest,
     TokenizeRequest,
     TokenizeResponse,
+    TokenizeResponsesRequest,
     TokenizerInfoResponse,
 )
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
@@ -27,6 +29,15 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
+
+
+class ResponsesInputRenderer(Protocol):
+    async def render_response_inputs(
+        self,
+        request: TokenizeResponsesRequest,
+        *,
+        skip_mm_cache: bool = False,
+    ) -> tuple[list[Any], list[Any]] | ErrorResponse: ...
 
 
 class ServingTokenization(BaseServing):
@@ -53,6 +64,12 @@ class ServingTokenization(BaseServing):
         self.chat_template_content_format: Final = chat_template_content_format
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.trust_request_chat_template = trust_request_chat_template
+        self.responses_renderer: ResponsesInputRenderer | None = None
+
+    def set_responses_renderer(
+        self, responses_renderer: ResponsesInputRenderer | None
+    ) -> None:
+        self.responses_renderer = responses_renderer
 
     async def create_tokenize(
         self,
@@ -67,7 +84,24 @@ class ServingTokenization(BaseServing):
 
         lora_request = self._maybe_get_adapters(request)
 
-        if isinstance(request, TokenizeChatRequest):
+        if isinstance(request, TokenizeResponsesRequest):
+            if self.responses_renderer is None:
+                return self.create_error_response(
+                    message=(
+                        "Responses API tokenization requires the Responses API "
+                        "serving handler."
+                    ),
+                    err_type="not_implemented_error",
+                    status_code=HTTPStatus.NOT_IMPLEMENTED,
+                )
+            render_result = await self.responses_renderer.render_response_inputs(
+                request,
+                skip_mm_cache=True,
+            )
+            if isinstance(render_result, ErrorResponse):
+                return render_result
+            _, engine_inputs = render_result
+        elif isinstance(request, TokenizeChatRequest):
             tool_dicts = (
                 None
                 if request.tools is None

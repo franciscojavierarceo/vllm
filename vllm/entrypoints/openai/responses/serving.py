@@ -325,6 +325,36 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
         return None
 
+    async def render_response_inputs(
+        self,
+        request: ResponsesRequest,
+        *,
+        skip_mm_cache: bool = False,
+    ) -> tuple[list[Any], list[EngineInput]] | ErrorResponse:
+        error_check_ret = await self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
+        validation_error = self._validate_create_responses_input(request)
+        if validation_error is not None:
+            return validation_error
+
+        prev_response_id = request.previous_response_id
+        if prev_response_id is not None:
+            async with self.response_store_lock:
+                prev_response = self.response_store.get(prev_response_id)
+            if prev_response is None:
+                return self._make_not_found_error(prev_response_id)
+        else:
+            prev_response = None
+
+        if self.use_harmony:
+            return self._make_request_with_harmony(request, prev_response)
+        return await self._make_request(
+            request,
+            prev_response,
+            skip_mm_cache=skip_mm_cache,
+        )
+
     async def create_responses(
         self,
         request: ResponsesRequest,
@@ -609,6 +639,8 @@ class OpenAIServingResponses(GenerateBaseServing):
         self,
         request: ResponsesRequest,
         prev_response: ResponsesResponse | None,
+        *,
+        skip_mm_cache: bool = False,
     ):
         tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
         # Construct the input messages.
@@ -627,6 +659,7 @@ class OpenAIServingResponses(GenerateBaseServing):
             default_template_kwargs=chat_template_kwargs,
             tool_dicts=tool_dicts,
             parser=self.parser,
+            skip_mm_cache=skip_mm_cache,
         )
         return messages, engine_inputs
 

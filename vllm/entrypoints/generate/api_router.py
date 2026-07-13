@@ -111,6 +111,7 @@ async def init_generate_state(
         if "generate" in supported_tasks
         else None
     )
+    state.serving_tokenization.set_responses_renderer(state.openai_serving_responses)
     _chat_kwargs = dict(
         engine_client=engine_client,
         models=state.openai_serving_models,

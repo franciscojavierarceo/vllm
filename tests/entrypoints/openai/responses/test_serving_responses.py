@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import AsyncExitStack
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -53,6 +53,8 @@ from vllm.inputs import tokens_input
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser.harmony import Segment
 from vllm.sampling_params import SamplingParams
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 class MockConversationContext(ConversationContext):
@@ -239,6 +241,76 @@ class TestInitializeToolSessions:
         )
 
         return instance
+
+    @pytest.mark.asyncio
+    async def test_render_response_inputs_reuses_generation_renderer(
+        self, serving_responses_instance
+    ):
+        serving_responses_instance._check_model = AsyncMock(return_value=None)
+        serving_responses_instance._make_request = AsyncMock(
+            return_value=(
+                [{"role": "user", "content": "hello"}],
+                [{"prompt_token_ids": [3, 4, 5]}],
+            )
+        )
+        request = ResponsesRequest(
+            model="test-model",
+            input="hello",
+            instructions="Be brief.",
+            tools=[],
+        )
+
+        result = await serving_responses_instance.render_response_inputs(
+            request,
+            skip_mm_cache=True,
+        )
+
+        assert not isinstance(result, ErrorResponse)
+        _, engine_inputs = result
+        assert engine_inputs[0]["prompt_token_ids"] == [3, 4, 5]
+        serving_responses_instance._make_request.assert_awaited_once_with(
+            request,
+            None,
+            skip_mm_cache=True,
+        )
+        serving_responses_instance.engine_client.generate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_render_response_inputs_matches_harmony_generation_prompt(
+        self, serving_responses_instance
+    ):
+        serving_responses_instance.use_harmony = True
+        serving_responses_instance._check_model = AsyncMock(return_value=None)
+        request = ResponsesRequest(
+            model="test-model",
+            input="hello",
+            instructions="Be brief.",
+            reasoning={"effort": "high"},
+            tools=[
+                {
+                    "type": "function",
+                    "name": "lookup_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+
+        _, generation_inputs = serving_responses_instance._make_request_with_harmony(
+            request,
+            None,
+        )
+        render_result = await serving_responses_instance.render_response_inputs(request)
+
+        assert not isinstance(render_result, ErrorResponse)
+        _, render_inputs = render_result
+        assert (
+            render_inputs[0]["prompt_token_ids"]
+            == generation_inputs[0]["prompt_token_ids"]
+        )
+        serving_responses_instance.engine_client.generate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_initialize_tool_sessions(
