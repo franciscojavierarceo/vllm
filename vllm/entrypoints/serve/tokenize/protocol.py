@@ -4,7 +4,7 @@
 
 from typing import Annotated, Any, TypeAlias
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Discriminator, Field, Tag, model_validator
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -163,9 +163,34 @@ class TokenizeResponsesRequest(ResponsesRequest):
     )
 
 
-TokenizeRequest: TypeAlias = (
-    TokenizeCompletionRequest | TokenizeChatRequest | TokenizeResponsesRequest
-)
+def _tokenize_request_kind(data: Any) -> str | None:
+    if isinstance(data, TokenizeResponsesRequest):
+        return "responses"
+    if isinstance(data, TokenizeChatRequest):
+        return "chat"
+    if isinstance(data, TokenizeCompletionRequest):
+        return "completion"
+    if not isinstance(data, dict):
+        return None
+
+    has_input = "input" in data
+    has_messages = "messages" in data
+    has_prompt = "prompt" in data
+    if has_input:
+        return None if has_messages else "responses"
+    if has_messages:
+        return None if has_prompt else "chat"
+    if has_prompt:
+        return "completion"
+    return None
+
+
+TokenizeRequest: TypeAlias = Annotated[
+    Annotated[TokenizeCompletionRequest, Tag("completion")]
+    | Annotated[TokenizeChatRequest, Tag("chat")]
+    | Annotated[TokenizeResponsesRequest, Tag("responses")],
+    Discriminator(_tokenize_request_kind),
+]
 
 
 class TokenizeResponse(OpenAIBaseModel):

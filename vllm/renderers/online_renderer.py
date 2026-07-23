@@ -412,9 +412,10 @@ class OnlineRenderer:
         *,
         cache_salt: str | None,
     ) -> EngineInput:
+        arrival_time = time.time()
         prompt_token_ids = render_for_completion(messages)
         engine_input = tokens_input(prompt_token_ids, cache_salt=cache_salt)
-        engine_input["arrival_time"] = time.time()
+        engine_input["arrival_time"] = arrival_time
         return engine_input
 
     def _responses_render_result(

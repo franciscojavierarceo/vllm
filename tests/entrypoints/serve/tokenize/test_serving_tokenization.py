@@ -6,9 +6,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from vllm.config.multimodal import MultiModalConfig
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.tokenize.protocol import (
@@ -39,6 +40,37 @@ def test_tokenize_request_accepts_responses_input():
     )
 
     assert type(request).__name__ == "TokenizeResponsesRequest"
+
+
+def test_tokenize_request_routes_responses_prompt_object_to_responses_validation():
+    with pytest.raises(ValidationError, match="prompt template is not supported"):
+        TypeAdapter(TokenizeRequest).validate_python(
+            {
+                "model": MODEL_NAME,
+                "input": "Test prompt",
+                "prompt": {"id": "pmpt_123", "version": "1"},
+            }
+        )
+
+
+def test_tokenize_request_schema_uses_one_of():
+    schema = TypeAdapter(TokenizeRequest).json_schema()
+
+    assert "oneOf" in schema
+    assert len(schema["oneOf"]) == 3
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"model": MODEL_NAME},
+        {"model": MODEL_NAME, "input": "responses", "messages": []},
+        {"model": MODEL_NAME, "prompt": "completion", "messages": []},
+    ],
+)
+def test_tokenize_request_requires_exactly_one_request_shape(payload):
+    with pytest.raises(ValidationError):
+        TypeAdapter(TokenizeRequest).validate_python(payload)
 
 
 @dataclass
@@ -75,7 +107,11 @@ class MockModelConfig:
         return self.diff_sampling_param or {}
 
 
-def _build_serving_tokenization(engine: AsyncLLM) -> ServingTokenization:
+def _build_serving_tokenization(
+    engine: AsyncLLM,
+    *,
+    tool_server=None,
+) -> ServingTokenization:
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
@@ -92,6 +128,7 @@ def _build_serving_tokenization(engine: AsyncLLM) -> ServingTokenization:
         online_renderer=online_renderer,
         chat_template=None,
         chat_template_content_format="auto",
+        tool_server=tool_server,
     )
 
 
@@ -153,22 +190,21 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
 
 
 @pytest.mark.asyncio
-async def test_tokenize_responses_uses_responses_renderer_path():
+async def test_tokenize_responses_uses_stateless_online_renderer_path():
     mock_engine = MagicMock(spec=AsyncLLM)
     mock_engine.errored = False
     mock_engine.model_config = MockModelConfig()
     mock_engine.input_processor = MagicMock()
     mock_engine.renderer = MagicMock()
 
-    serving = _build_serving_tokenization(mock_engine)
-    responses_renderer = MagicMock()
-    responses_renderer.render_response_inputs = AsyncMock(
-        return_value=(
-            [{"role": "user", "content": "Test prompt"}],
-            [{"prompt_token_ids": [7, 8, 9]}],
+    tool_server = MagicMock()
+    serving = _build_serving_tokenization(mock_engine, tool_server=tool_server)
+    serving.online_renderer.render_responses = AsyncMock(
+        return_value=MagicMock(
+            messages=[{"role": "user", "content": "Test prompt"}],
+            engine_input={"prompt_token_ids": [7, 8, 9]},
         )
     )
-    serving.set_responses_renderer(responses_renderer)
 
     request = TokenizeResponsesRequest(
         model=MODEL_NAME,
@@ -178,7 +214,34 @@ async def test_tokenize_responses_uses_responses_renderer_path():
     response = await serving.create_tokenize(request, MagicMock(headers={}))
 
     assert response.tokens == [7, 8, 9]
-    responses_renderer.render_response_inputs.assert_awaited_once_with(
+    serving.online_renderer.render_responses.assert_awaited_once_with(
         request,
+        previous_messages=None,
+        previous_response_outputs=None,
+        tool_server=tool_server,
         skip_mm_cache=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_tokenize_responses_rejects_previous_response_id():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = MagicMock()
+
+    serving = _build_serving_tokenization(mock_engine)
+    serving.online_renderer.render_responses = AsyncMock()
+    request = TokenizeResponsesRequest(
+        model=MODEL_NAME,
+        input="Test prompt",
+        previous_response_id="resp_previous",
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.error.code == 400
+    assert response.error.param == "previous_response_id"
+    serving.online_renderer.render_responses.assert_not_awaited()

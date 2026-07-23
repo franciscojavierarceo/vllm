@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from http import HTTPStatus
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 
@@ -30,14 +29,8 @@ from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 
-
-class ResponsesInputRenderer(Protocol):
-    async def render_response_inputs(
-        self,
-        request: TokenizeResponsesRequest,
-        *,
-        skip_mm_cache: bool = False,
-    ) -> tuple[list[Any], list[Any]] | ErrorResponse: ...
+if TYPE_CHECKING:
+    from vllm.entrypoints.mcp.tool_server import ToolServer
 
 
 class ServingTokenization(BaseServing):
@@ -51,6 +44,7 @@ class ServingTokenization(BaseServing):
         default_chat_template_kwargs: dict[str, Any] | None = None,
         trust_request_chat_template: bool = False,
         request_logger: RequestLogger | None = None,
+        tool_server: "ToolServer | None" = None,
     ) -> None:
         super().__init__(
             models=models,
@@ -64,12 +58,7 @@ class ServingTokenization(BaseServing):
         self.chat_template_content_format: Final = chat_template_content_format
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.trust_request_chat_template = trust_request_chat_template
-        self.responses_renderer: ResponsesInputRenderer | None = None
-
-    def set_responses_renderer(
-        self, responses_renderer: ResponsesInputRenderer | None
-    ) -> None:
-        self.responses_renderer = responses_renderer
+        self.tool_server = tool_server
 
     async def create_tokenize(
         self,
@@ -85,22 +74,25 @@ class ServingTokenization(BaseServing):
         lora_request = self._maybe_get_adapters(request)
 
         if isinstance(request, TokenizeResponsesRequest):
-            if self.responses_renderer is None:
+            if request.previous_response_id is not None:
                 return self.create_error_response(
                     message=(
-                        "Responses API tokenization requires the Responses API "
-                        "serving handler."
+                        "previous_response_id is not supported by the stateless "
+                        "tokenize endpoint."
                     ),
-                    err_type="not_implemented_error",
-                    status_code=HTTPStatus.NOT_IMPLEMENTED,
+                    err_type="invalid_request_error",
+                    param="previous_response_id",
                 )
-            render_result = await self.responses_renderer.render_response_inputs(
+            render_result = await self.online_renderer.render_responses(
                 request,
+                previous_messages=None,
+                previous_response_outputs=None,
+                tool_server=self.tool_server,
                 skip_mm_cache=True,
             )
             if isinstance(render_result, ErrorResponse):
                 return render_result
-            _, engine_inputs = render_result
+            engine_inputs = [render_result.engine_input]
         elif isinstance(request, TokenizeChatRequest):
             tool_dicts = (
                 None

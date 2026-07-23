@@ -361,6 +361,23 @@ async def test_online_renderer_returns_typed_error_for_bad_harmony_call_referenc
     assert "No call message found for missing" in result.error.message
 
 
+@pytest.mark.asyncio
+async def test_online_renderer_rejects_unavailable_harmony_builtin_tool():
+    renderer = OnlineRenderer.__new__(OnlineRenderer)
+    renderer.use_harmony = True
+    request = ResponsesRequest(
+        input="search",
+        tools=[{"type": "web_search_preview"}],
+    )
+
+    result = await renderer.render_responses(request, tool_server=None)
+
+    assert isinstance(result, ErrorResponse)
+    assert result.error.type == "invalid_request_error"
+    assert result.error.param == "tools"
+    assert "web_search_preview" in result.error.message
+
+
 class TestInitializeToolSessions:
     """Test class for _initialize_tool_sessions method"""
 

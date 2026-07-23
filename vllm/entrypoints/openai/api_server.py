@@ -27,6 +27,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
+from vllm.entrypoints.mcp.tool_server import init_tool_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
@@ -393,6 +394,7 @@ async def init_app_state(
     state.vllm_config = vllm_config
     state.args = args
     resolved_chat_template = load_chat_template(args.chat_template)
+    state.tool_server = await init_tool_server(args)
 
     # Merge default_mm_loras into the static lora_modules
     default_mm_loras = (
@@ -447,6 +449,7 @@ async def init_app_state(
         chat_template_content_format=args.chat_template_content_format,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
+        tool_server=state.tool_server,
     )
 
     if "generate" in supported_tasks:
@@ -511,6 +514,7 @@ async def init_render_app_state(
 
     renderer = renderer_from_config(vllm_config)
     resolved_chat_template = load_chat_template(args.chat_template)
+    state.tool_server = await init_tool_server(args)
 
     state.online_renderer = OnlineRenderer(
         model_config=vllm_config.model_config,
@@ -551,6 +555,7 @@ async def init_render_app_state(
         chat_template_content_format=args.chat_template_content_format,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
+        tool_server=state.tool_server,
     )
 
     from vllm.entrypoints.scale_out.factories import init_render_state
