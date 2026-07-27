@@ -186,8 +186,20 @@ def _tokenize_request_kind(data: Any) -> str | None:
 
 TokenizeRequest: TypeAlias = Annotated[
     Annotated[TokenizeCompletionRequest, Tag("completion")]
-    | Annotated[TokenizeChatRequest, Tag("chat")]
-    | Annotated[TokenizeResponsesRequest, Tag("responses")],
+    | Annotated[
+        TokenizeChatRequest,
+        Tag("chat"),
+        Field(json_schema_extra={"not": {"required": ["prompt"]}}),
+    ]
+    | Annotated[
+        TokenizeResponsesRequest,
+        Tag("responses"),
+        Field(
+            json_schema_extra={
+                "not": {"anyOf": [{"required": ["prompt"]}, {"required": ["messages"]}]}
+            }
+        ),
+    ],
     Discriminator(_tokenize_request_kind),
 ]
 

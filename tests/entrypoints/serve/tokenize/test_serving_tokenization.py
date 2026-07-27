@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import TypeAdapter, ValidationError
 
 from vllm.config.multimodal import MultiModalConfig
@@ -39,14 +40,51 @@ def test_tokenize_request_accepts_responses_input():
         }
     )
 
-    assert type(request).__name__ == "TokenizeResponsesRequest"
+    assert isinstance(request, TokenizeResponsesRequest)
 
 
-def test_tokenize_request_schema_uses_one_of():
-    schema = TypeAdapter(TokenizeRequest).json_schema()
+@pytest.mark.parametrize(
+    ("payload", "expected_type"),
+    [
+        (
+            {"input": "responses", "messages": []},
+            TokenizeChatRequest,
+        ),
+        (
+            {"prompt": "completion", "messages": []},
+            TokenizeCompletionRequest,
+        ),
+        (
+            {"prompt": "completion", "input": "responses"},
+            TokenizeCompletionRequest,
+        ),
+        (
+            {
+                "prompt": "completion",
+                "messages": [],
+                "input": "responses",
+            },
+            TokenizeCompletionRequest,
+        ),
+        ({}, None),
+        ({"input": "responses", "prompt": None}, None),
+        ({"messages": [], "prompt": None}, None),
+        ({"input": "responses", "prompt": {"id": "resp_123"}}, None),
+        ({"input": "responses", "messages": "invalid"}, None),
+    ],
+)
+def test_tokenize_request_schema_matches_runtime_routing(payload, expected_type):
+    adapter = TypeAdapter(TokenizeRequest)
+    schema_validator = Draft202012Validator(adapter.json_schema())
 
-    assert "oneOf" in schema
-    assert len(schema["oneOf"]) == 3
+    assert schema_validator.is_valid(payload) is (expected_type is not None)
+
+    if expected_type is None:
+        with pytest.raises(ValidationError):
+            adapter.validate_python(payload)
+    else:
+        request = adapter.validate_python(payload)
+        assert isinstance(request, expected_type)
 
 
 @pytest.mark.parametrize(
@@ -140,6 +178,15 @@ def _build_serving_tokenization(
     )
 
 
+def _build_mock_engine() -> MagicMock:
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = MagicMock()
+    return mock_engine
+
+
 @pytest.mark.asyncio
 async def test_tokenize_chat_skips_mm_cache_for_renderer_only_path():
     mock_engine = MagicMock(spec=AsyncLLM)
@@ -199,11 +246,7 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
 
 @pytest.mark.asyncio
 async def test_tokenize_responses_uses_stateless_online_renderer_path():
-    mock_engine = MagicMock(spec=AsyncLLM)
-    mock_engine.errored = False
-    mock_engine.model_config = MockModelConfig()
-    mock_engine.input_processor = MagicMock()
-    mock_engine.renderer = MagicMock()
+    mock_engine = _build_mock_engine()
 
     tool_server = MagicMock()
     serving = _build_serving_tokenization(mock_engine, tool_server=tool_server)
@@ -232,12 +275,53 @@ async def test_tokenize_responses_uses_stateless_online_renderer_path():
 
 
 @pytest.mark.asyncio
+async def test_tokenize_responses_returns_renderer_error_response_unchanged():
+    mock_engine = _build_mock_engine()
+    serving = _build_serving_tokenization(mock_engine)
+    renderer_error = ErrorResponse(
+        error={
+            "message": "renderer rejected the request",
+            "type": "invalid_request_error",
+            "code": 400,
+        }
+    )
+    serving.online_renderer.render_responses = AsyncMock(return_value=renderer_error)
+
+    request = TokenizeResponsesRequest(model=MODEL_NAME, input="Test prompt")
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert response is renderer_error
+
+
+@pytest.mark.asyncio
+async def test_tokenize_responses_returns_token_strings_for_rendered_token_ids():
+    mock_engine = _build_mock_engine()
+    tokenizer = mock_engine.renderer.get_tokenizer.return_value
+    tokenizer.convert_ids_to_tokens.return_value = [
+        "seven",
+        "eight",
+        "nine",
+    ]
+    serving = _build_serving_tokenization(mock_engine)
+    serving.online_renderer.render_responses = AsyncMock(
+        return_value=MagicMock(engine_input={"prompt_token_ids": [7, 8, 9]})
+    )
+
+    request = TokenizeResponsesRequest(
+        model=MODEL_NAME,
+        input="Test prompt",
+        return_token_strs=True,
+    )
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert response.tokens == [7, 8, 9]
+    assert response.token_strs == ["seven", "eight", "nine"]
+    tokenizer.convert_ids_to_tokens.assert_called_once_with([7, 8, 9])
+
+
+@pytest.mark.asyncio
 async def test_tokenize_responses_rejects_previous_response_id():
-    mock_engine = MagicMock(spec=AsyncLLM)
-    mock_engine.errored = False
-    mock_engine.model_config = MockModelConfig()
-    mock_engine.input_processor = MagicMock()
-    mock_engine.renderer = MagicMock()
+    mock_engine = _build_mock_engine()
 
     serving = _build_serving_tokenization(mock_engine)
     serving.online_renderer.render_responses = AsyncMock()
@@ -257,11 +341,7 @@ async def test_tokenize_responses_rejects_previous_response_id():
 
 @pytest.mark.asyncio
 async def test_tokenize_responses_rejects_untrusted_request_template():
-    mock_engine = MagicMock(spec=AsyncLLM)
-    mock_engine.errored = False
-    mock_engine.model_config = MockModelConfig()
-    mock_engine.input_processor = MagicMock()
-    mock_engine.renderer = MagicMock()
+    mock_engine = _build_mock_engine()
 
     serving = _build_serving_tokenization(mock_engine)
     serving.trust_request_chat_template = False
