@@ -253,3 +253,28 @@ async def test_tokenize_responses_rejects_previous_response_id():
     assert response.error.code == 400
     assert response.error.param == "previous_response_id"
     serving.online_renderer.render_responses.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tokenize_responses_rejects_untrusted_request_template():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = MagicMock()
+
+    serving = _build_serving_tokenization(mock_engine)
+    serving.trust_request_chat_template = False
+    serving.online_renderer.render_responses = AsyncMock()
+    request = TokenizeResponsesRequest(
+        model=MODEL_NAME,
+        input="Test prompt",
+        chat_template_kwargs={"chat_template": "{{ messages }}"},
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.error.code == 400
+    assert "untrusted chat template" in response.error.message.lower()
+    serving.online_renderer.render_responses.assert_not_awaited()

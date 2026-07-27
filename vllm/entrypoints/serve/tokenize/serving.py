@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 
@@ -18,6 +18,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeChatRequest,
     TokenizeRequest,
     TokenizeResponse,
+    TokenizeResponsesRequest,
     TokenizerInfoResponse,
 )
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
@@ -27,6 +28,9 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.mcp.tool_server import ToolServer
 
 
 class ServingTokenization(BaseServing):
@@ -40,6 +44,7 @@ class ServingTokenization(BaseServing):
         default_chat_template_kwargs: dict[str, Any] | None = None,
         trust_request_chat_template: bool = False,
         request_logger: RequestLogger | None = None,
+        tool_server: "ToolServer | None" = None,
     ) -> None:
         super().__init__(
             models=models,
@@ -53,6 +58,7 @@ class ServingTokenization(BaseServing):
         self.chat_template_content_format: Final = chat_template_content_format
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.trust_request_chat_template = trust_request_chat_template
+        self.tool_server = tool_server
 
     async def create_tokenize(
         self,
@@ -67,7 +73,34 @@ class ServingTokenization(BaseServing):
 
         lora_request = self._maybe_get_adapters(request)
 
-        if isinstance(request, TokenizeChatRequest):
+        if isinstance(request, TokenizeResponsesRequest):
+            if request.previous_response_id is not None:
+                return self.create_error_response(
+                    message=(
+                        "previous_response_id is not supported by the stateless "
+                        "tokenize endpoint."
+                    ),
+                    err_type="invalid_request_error",
+                    param="previous_response_id",
+                )
+            template_error = self.online_renderer.validate_chat_template(
+                request_chat_template=None,
+                chat_template_kwargs=request.chat_template_kwargs,
+                trust_request_chat_template=self.trust_request_chat_template,
+            )
+            if template_error is not None:
+                return template_error
+            render_result = await self.online_renderer.render_responses(
+                request,
+                previous_messages=None,
+                previous_response_outputs=None,
+                tool_server=self.tool_server,
+                skip_mm_cache=True,
+            )
+            if isinstance(render_result, ErrorResponse):
+                return render_result
+            engine_inputs = [render_result.engine_input]
+        elif isinstance(request, TokenizeChatRequest):
             tool_dicts = (
                 None
                 if request.tools is None

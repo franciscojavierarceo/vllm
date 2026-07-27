@@ -326,6 +326,7 @@ async def init_app_state(
         chat_template_content_format=args.chat_template_content_format,
         default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
+        tool_server=state.tool_server,
     )
 
     if "generate" in supported_tasks:
@@ -438,6 +439,7 @@ async def init_render_app_state(
         chat_template_content_format=args.chat_template_content_format,
         default_chat_template_kwargs=default_chat_template_kwargs,
         trust_request_chat_template=args.trust_request_chat_template,
+        tool_server=state.tool_server,
     )
 
     from vllm.entrypoints.scale_out.factories import init_render_state
