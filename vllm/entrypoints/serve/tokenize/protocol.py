@@ -4,7 +4,7 @@
 
 from typing import Annotated, Any, TypeAlias
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Discriminator, Field, Tag, model_validator
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -17,6 +17,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import (
     OpenAIBaseModel,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 
@@ -155,7 +156,40 @@ class TokenizeChatRequest(OpenAIBaseModel):
         )
 
 
-TokenizeRequest: TypeAlias = TokenizeCompletionRequest | TokenizeChatRequest
+class TokenizeResponsesRequest(ResponsesRequest):
+    return_token_strs: bool | None = Field(
+        default=False,
+        description=(
+            "If true, also return the token strings corresponding to the token ids."
+        ),
+    )
+
+
+def _tokenize_request_kind(data: Any) -> str | None:
+    if isinstance(data, TokenizeResponsesRequest):
+        return "responses"
+    if isinstance(data, TokenizeChatRequest):
+        return "chat"
+    if isinstance(data, TokenizeCompletionRequest):
+        return "completion"
+    if not isinstance(data, dict):
+        return None
+
+    if "prompt" in data:
+        return "completion"
+    if "messages" in data:
+        return "chat"
+    if "input" in data:
+        return "responses"
+    return None
+
+
+TokenizeRequest: TypeAlias = Annotated[
+    Annotated[TokenizeCompletionRequest, Tag("completion")]
+    | Annotated[TokenizeChatRequest, Tag("chat")]
+    | Annotated[TokenizeResponsesRequest, Tag("responses")],
+    Discriminator(_tokenize_request_kind),
+]
 
 
 class TokenizeResponse(OpenAIBaseModel):
