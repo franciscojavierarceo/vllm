@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 from fastapi import Request
 
@@ -11,6 +11,8 @@ from vllm.entrypoints.openai.models.serving import (
     OpenAIModelRegistry,
     OpenAIServingModels,
 )
+from vllm.entrypoints.openai.parser.harmony_utils import MCP_BUILTIN_TOOLS
+from vllm.entrypoints.openai.responses.utils import extract_tool_types
 from vllm.entrypoints.serve.engine.serving import BaseServing
 from vllm.entrypoints.serve.tokenize.protocol import (
     DetokenizeRequest,
@@ -29,9 +31,6 @@ from vllm.tokenizers import TokenizerLike
 
 logger = init_logger(__name__)
 
-if TYPE_CHECKING:
-    from vllm.entrypoints.mcp.tool_server import ToolServer
-
 
 class ServingTokenization(BaseServing):
     def __init__(
@@ -44,7 +43,6 @@ class ServingTokenization(BaseServing):
         default_chat_template_kwargs: dict[str, Any] | None = None,
         trust_request_chat_template: bool = False,
         request_logger: RequestLogger | None = None,
-        tool_server: "ToolServer | None" = None,
     ) -> None:
         super().__init__(
             models=models,
@@ -58,7 +56,6 @@ class ServingTokenization(BaseServing):
         self.chat_template_content_format: Final = chat_template_content_format
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
         self.trust_request_chat_template = trust_request_chat_template
-        self.tool_server = tool_server
 
     async def create_tokenize(
         self,
@@ -90,11 +87,23 @@ class ServingTokenization(BaseServing):
             )
             if template_error is not None:
                 return template_error
+            if (
+                self.online_renderer.use_harmony
+                and extract_tool_types(request.tools) & MCP_BUILTIN_TOOLS
+            ):
+                return self.create_error_response(
+                    message=(
+                        "Server-managed Harmony builtin tool metadata is not "
+                        "available through /tokenize. Use /v1/responses/render."
+                    ),
+                    err_type="invalid_request_error",
+                    param="tools",
+                )
             render_result = await self.online_renderer.render_responses(
                 request,
                 previous_messages=None,
                 previous_response_outputs=None,
-                tool_server=self.tool_server,
+                tool_server=None,
                 skip_mm_cache=True,
             )
             if isinstance(render_result, ErrorResponse):
@@ -143,6 +152,9 @@ class ServingTokenization(BaseServing):
             prompt_components = self._extract_prompt_components(engine_input)
             if prompt_components.token_ids is not None:
                 input_ids.extend(prompt_components.token_ids)
+
+        if isinstance(request, TokenizeResponsesRequest) and not input_ids:
+            return self.create_error_response("No token_ids rendered")
 
         token_strs = None
         if request.return_token_strs:

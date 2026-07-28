@@ -152,6 +152,25 @@ For further details on derenderer APIs, please refer to [this page](derenderer.m
 - `/detokenize` - Detokenize tokens
 - `/tokenizer_info` - Get comprehensive tokenizer information including chat templates and configuration
 
+`/tokenize` also accepts a self-contained Responses request. It uses the same
+prompt construction as `/v1/responses/render`, so the returned token IDs can be
+used for precise-prefix routing before the request is sent to a model replica.
+The endpoint is stateless and rejects `previous_response_id`.
+
+```bash
+curl http://localhost:8000/tokenize \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "input": "Explain prefix caching in one sentence.",
+        "max_output_tokens": 32
+    }'
+```
+
+Because `/tokenize` is not protected by vLLM's API-key middleware, it rejects
+Harmony builtin tool requests rather than rendering server-managed metadata.
+Use the authenticated `/v1/responses/render` endpoint for those requests.
+
 ## Elastic Expert Parallelism (EEP)
 
 - `/scale_elastic_ep` - Trigger scaling operations

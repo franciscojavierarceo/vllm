@@ -212,6 +212,10 @@ The following endpoints **do not require authentication** even when `--api-key` 
 - `/version` - Version information
 - `/load` - Server load metrics
 
+Responses-shaped `/tokenize` requests reject Harmony builtin tools rather than
+rendering server-managed metadata. Use the authenticated
+`/v1/responses/render` endpoint when that metadata is required.
+
 **Tokenizer information endpoint (only when `--enable-tokenizer-info-endpoint` is set):**
 
 This endpoint is **only available when the `--enable-tokenizer-info-endpoint` flag is set**. It may expose sensitive information such as chat templates and tokenizer configuration:

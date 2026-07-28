@@ -199,6 +199,31 @@ async def test_tokenize_chat_with_tools(
 
 
 @pytest.mark.asyncio
+async def test_tokenize_responses_matches_responses_render(
+    server: RemoteOpenAIServer,
+):
+    request = {
+        "model": MODEL_NAME,
+        "input": "Explain prefix caching in one sentence.",
+        "instructions": "Be concise.",
+        "max_output_tokens": 32,
+    }
+
+    tokenize_response = requests.post(
+        server.url_for("tokenize"),
+        json=request,
+    )
+    tokenize_response.raise_for_status()
+    render_response = requests.post(
+        server.url_for("v1/responses/render"),
+        json=request,
+    )
+    render_response.raise_for_status()
+
+    assert tokenize_response.json()["tokens"] == render_response.json()["token_ids"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "model_name, tokenizer_name",
     [(MODEL_NAME, MODEL_NAME)],

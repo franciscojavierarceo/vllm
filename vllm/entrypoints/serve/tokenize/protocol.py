@@ -4,7 +4,7 @@
 
 from typing import Annotated, Any, TypeAlias
 
-from pydantic import ConfigDict, Discriminator, Field, Tag, model_validator
+from pydantic import ConfigDict, Field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -157,6 +157,14 @@ class TokenizeChatRequest(OpenAIBaseModel):
 
 
 class TokenizeResponsesRequest(ResponsesRequest):
+    messages: None = Field(
+        default=None,
+        description="Chat messages must use the chat tokenize request shape.",
+    )
+    prompt: None = Field(
+        default=None,
+        description="Prompt templates are not supported by vLLM.",
+    )
     return_token_strs: bool | None = Field(
         default=False,
         description=(
@@ -165,42 +173,9 @@ class TokenizeResponsesRequest(ResponsesRequest):
     )
 
 
-def _tokenize_request_kind(data: Any) -> str | None:
-    if isinstance(data, TokenizeResponsesRequest):
-        return "responses"
-    if isinstance(data, TokenizeChatRequest):
-        return "chat"
-    if isinstance(data, TokenizeCompletionRequest):
-        return "completion"
-    if not isinstance(data, dict):
-        return None
-
-    if "prompt" in data:
-        return "completion"
-    if "messages" in data:
-        return "chat"
-    if "input" in data:
-        return "responses"
-    return None
-
-
 TokenizeRequest: TypeAlias = Annotated[
-    Annotated[TokenizeCompletionRequest, Tag("completion")]
-    | Annotated[
-        TokenizeChatRequest,
-        Tag("chat"),
-        Field(json_schema_extra={"not": {"required": ["prompt"]}}),
-    ]
-    | Annotated[
-        TokenizeResponsesRequest,
-        Tag("responses"),
-        Field(
-            json_schema_extra={
-                "not": {"anyOf": [{"required": ["prompt"]}, {"required": ["messages"]}]}
-            }
-        ),
-    ],
-    Discriminator(_tokenize_request_kind),
+    TokenizeCompletionRequest | TokenizeChatRequest | TokenizeResponsesRequest,
+    Field(union_mode="left_to_right"),
 ]
 
 

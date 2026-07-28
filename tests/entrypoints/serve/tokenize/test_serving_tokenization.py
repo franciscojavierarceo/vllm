@@ -67,10 +67,20 @@ def test_tokenize_request_accepts_responses_input():
             TokenizeCompletionRequest,
         ),
         ({}, None),
-        ({"input": "responses", "prompt": None}, None),
-        ({"messages": [], "prompt": None}, None),
+        (
+            {"input": "responses", "prompt": None},
+            TokenizeResponsesRequest,
+        ),
+        (
+            {"messages": [], "prompt": None},
+            TokenizeChatRequest,
+        ),
+        (
+            {"input": "responses", "messages": "invalid"},
+            None,
+        ),
+        ({"input": "responses", "messages": None}, TokenizeResponsesRequest),
         ({"input": "responses", "prompt": {"id": "resp_123"}}, None),
-        ({"input": "responses", "messages": "invalid"}, None),
     ],
 )
 def test_tokenize_request_schema_matches_runtime_routing(payload, expected_type):
@@ -153,11 +163,7 @@ class MockModelConfig:
         return self.diff_sampling_param or {}
 
 
-def _build_serving_tokenization(
-    engine: AsyncLLM,
-    *,
-    tool_server=None,
-) -> ServingTokenization:
+def _build_serving_tokenization(engine: AsyncLLM) -> ServingTokenization:
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
@@ -174,7 +180,6 @@ def _build_serving_tokenization(
         online_renderer=online_renderer,
         chat_template=None,
         chat_template_content_format="auto",
-        tool_server=tool_server,
     )
 
 
@@ -248,8 +253,7 @@ async def test_tokenize_completion_skips_mm_cache_for_renderer_only_path():
 async def test_tokenize_responses_uses_stateless_online_renderer_path():
     mock_engine = _build_mock_engine()
 
-    tool_server = MagicMock()
-    serving = _build_serving_tokenization(mock_engine, tool_server=tool_server)
+    serving = _build_serving_tokenization(mock_engine)
     serving.online_renderer.render_responses = AsyncMock(
         return_value=MagicMock(
             messages=[{"role": "user", "content": "Test prompt"}],
@@ -269,9 +273,75 @@ async def test_tokenize_responses_uses_stateless_online_renderer_path():
         request,
         previous_messages=None,
         previous_response_outputs=None,
-        tool_server=tool_server,
+        tool_server=None,
         skip_mm_cache=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_tokenize_responses_rejects_server_managed_harmony_tools():
+    mock_engine = _build_mock_engine()
+    serving = _build_serving_tokenization(mock_engine)
+    serving.online_renderer.use_harmony = True
+    serving.online_renderer.render_responses = AsyncMock()
+    request = TokenizeResponsesRequest(
+        model=MODEL_NAME,
+        input="Search for vLLM",
+        tools=[{"type": "web_search_preview"}],
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.error.code == 400
+    assert response.error.param == "tools"
+    serving.online_renderer.render_responses.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tokenize_responses_allows_user_supplied_harmony_tools():
+    mock_engine = _build_mock_engine()
+    serving = _build_serving_tokenization(mock_engine)
+    serving.online_renderer.use_harmony = True
+    serving.online_renderer.render_responses = AsyncMock(
+        return_value=MagicMock(engine_input={"prompt_token_ids": [7, 8, 9]})
+    )
+    request = TokenizeResponsesRequest(
+        model=MODEL_NAME,
+        input="Look up the weather",
+        tools=[
+            {
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert response.tokens == [7, 8, 9]
+
+
+@pytest.mark.asyncio
+async def test_tokenize_responses_rejects_empty_rendered_token_ids():
+    mock_engine = _build_mock_engine()
+    serving = _build_serving_tokenization(mock_engine)
+    serving.online_renderer.render_responses = AsyncMock(
+        return_value=MagicMock(engine_input={"prompt_token_ids": []})
+    )
+    request = TokenizeResponsesRequest(
+        model=MODEL_NAME,
+        input="Test prompt",
+        max_output_tokens=100,
+        truncation="auto",
+    )
+
+    response = await serving.create_tokenize(request, MagicMock(headers={}))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.error.code == 400
+    assert response.error.message == "No token_ids rendered"
 
 
 @pytest.mark.asyncio
