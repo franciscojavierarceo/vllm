@@ -20,6 +20,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
     TokenizeResponsesRequest,
 )
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
+from vllm.exceptions import VLLMValidationError
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.v1.engine.async_llm import AsyncLLM
 
@@ -90,7 +91,7 @@ def test_tokenize_request_schema_matches_runtime_routing(payload, expected_type)
     assert schema_validator.is_valid(payload) is (expected_type is not None)
 
     if expected_type is None:
-        with pytest.raises(ValidationError):
+        with pytest.raises((ValidationError, VLLMValidationError)):
             adapter.validate_python(payload)
     else:
         request = adapter.validate_python(payload)
