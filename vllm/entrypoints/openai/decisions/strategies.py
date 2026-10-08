@@ -13,6 +13,7 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, ClassVar, TypeVar
@@ -155,7 +156,7 @@ class ReadStrategy(ABC):
         self,
         questions: list[Question],
         instructions: str | None,
-        state: str,
+        state: str | list[dict[str, Any]],
         *,
         request_id: str,
         chat_template_kwargs: dict[str, Any] | None,
@@ -328,7 +329,7 @@ class NextTokenStrategy(ReadStrategy):
         self,
         questions: list[Question],
         instructions: str | None,
-        state: str,
+        state: str | list[dict[str, Any]],
         *,
         request_id: str,
         chat_template_kwargs: dict[str, Any] | None,
@@ -344,10 +345,21 @@ class NextTokenStrategy(ReadStrategy):
 
         slots, engine_inputs, params = [], [], []
         for q in questions:
-            content: Any = self._content(state, q)
-            if image_parts:
-                content = [*image_parts, {"type": "text", "text": content}]
-            messages = [{"role": "user", "content": content}]
+            messages: list[dict[str, Any]]
+            if isinstance(state, str):
+                content: Any = self._content(state, q)
+                if image_parts:
+                    content = [*image_parts, {"type": "text", "text": content}]
+                messages = [{"role": "user", "content": content}]
+            else:
+                if not ctx.engine_client.model_config.is_multimodal_model:
+                    raise StructuredDecisionError(
+                        "This model does not support image input"
+                    )
+                messages = deepcopy(state)
+                messages[-1]["content"].append(
+                    {"type": "text", "text": "\n\n" + q.type.prompt(q)}
+                )
             if instructions:
                 messages.insert(0, {"role": "system", "content": instructions})
             engine_input, prompt_ids = await self._render(read_request, messages)
@@ -1184,8 +1196,11 @@ def select_read_strategy(
     if protocol == "winnow":
         from .winnow import WinnowStrategy
 
-        if model_config.architecture != "Gemma4ForCausalLM":
-            raise ValueError("Winnow requires Gemma4ForCausalLM")
+        if model_config.architecture not in {
+            "Gemma4ForCausalLM",
+            "Gemma4ForConditionalGeneration",
+        }:
+            raise ValueError("Winnow requires a Gemma4 causal or multimodal model")
         if model_config.logprobs_mode != "raw_logprobs":
             raise ValueError("Winnow requires raw_logprobs")
         return WinnowStrategy
