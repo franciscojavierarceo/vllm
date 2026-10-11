@@ -30,8 +30,9 @@ def request(**kwargs):
 def test_predicate_returns_probability_of_true_and_null_name():
     question = request().questions[0]
     read = make_read_question(0, question)
-    assert [option.name for option in read.options] == ["false", "true"]
-    assert make_answer(question, [0.1, 0.9], 0.5).model_dump() == {
+    assert read.type.name == "noul"
+    assert read.labels == ("yes", "no")
+    assert make_answer(question, read, [0.9, 0.1], 0.5).model_dump() == {
         "type": "predicate",
         "name": None,
         "probability": 0.9,
@@ -51,7 +52,7 @@ def test_choice_preserves_boolean_and_string_values():
     ).questions[0]
     read = make_read_question(0, question)
     assert [option.name for option in read.options] == ["true", '"true"', "false"]
-    answer = make_answer(question, [0.7, 0.2, 0.1], 0.5).model_dump()
+    answer = make_answer(question, read, [0.7, 0.2, 0.1], 0.5).model_dump()
     assert answer["name"] == "decision"
     assert answer["choice"] is True
     assert answer["probabilities"] == [
@@ -72,7 +73,9 @@ def test_score_is_weighted_average_of_zero_based_level_indices():
             }
         ]
     ).questions[0]
-    answer = make_answer(question, [0.1, 0.7, 0.2], 0.8).model_dump()
+    read = make_read_question(0, question)
+    assert read.labels == ("0", "1", "2")
+    answer = make_answer(question, read, [0.1, 0.7, 0.2], 0.8).model_dump()
     assert answer["score"] == pytest.approx(1.1)
     assert answer["probabilities"] == [
         {"value": 0, "label": "low", "probability": 0.1},
@@ -119,8 +122,8 @@ def test_score_levels_with_the_same_label_keep_their_positions():
         ]
     ).questions[0]
     read = make_read_question(0, question)
-    assert read.labels == ("A", "B")
-    answer = make_answer(question, [0.1, 0.9], 0.8).model_dump()
+    assert read.labels == ("0", "1")
+    answer = make_answer(question, read, [0.1, 0.9], 0.8).model_dump()
     assert answer["score"] == pytest.approx(0.9)
     assert [p["value"] for p in answer["probabilities"]] == [0, 1]
 
@@ -236,5 +239,5 @@ def test_backend_rejects_more_choices_than_single_token_labels():
             }
         ]
     ).questions[0]
-    with pytest.raises(StructuredDecisionError, match="at most 26 choices"):
+    with pytest.raises(StructuredDecisionError, match="at most 26 options"):
         make_read_question(0, question)

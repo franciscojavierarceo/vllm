@@ -10,6 +10,7 @@ probabilities.
 import math
 import string
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -109,13 +110,23 @@ def build_question(
     names = [o.name for o in options]
     if len(set(names)) != len(names):
         raise StructuredDecisionError(f"question {qid!r}: duplicate option names")
+    if not isinstance(instructions, str):
+        instructions = "" if instructions is None else str(instructions)
+    return make_question(qid, qtype, instructions, options, max_options)
+
+
+def make_question(
+    qid: str,
+    qtype: QuestionType,
+    instructions: str,
+    options: Sequence[Option],
+    max_options: int,
+) -> Question:
     limit = min(max_options, len(qtype.label_set))
     if len(options) > limit:
         raise StructuredDecisionError(
             f"question {qid!r}: at most {limit} options for this model"
         )
-    if not isinstance(instructions, str):
-        instructions = "" if instructions is None else str(instructions)
     return Question(
         id=qid,
         type=qtype,

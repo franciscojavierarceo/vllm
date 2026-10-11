@@ -55,8 +55,10 @@ authenticate callers.
 
 This MVP uses the same autoregressive label-reading backend as
 [structured decisions](structured_decisions.md). It supports the same Qwen
-architectures and logprob modes; other models return 501. Each question reads
-one token, using A–Z labels checked against the tokenizer at startup. Usage
+architectures and logprob modes; other models return 501. Predicate, choice,
+and score questions are read as the structured decisions `noul`, `choice`, and
+`score` question types: one token per question, labeled `yes`/`no`, A–Z, or
+0–9, checked against the tokenizer at startup. Usage
 reports the actual prompt and output tokens across these reads, including
 prefix-cache counters.
 
