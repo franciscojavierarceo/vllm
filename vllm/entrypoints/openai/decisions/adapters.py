@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Translate Decisions questions and answers to and from label reads."""
+"""Map Decisions questions onto the /v1/systemone question types, and their
+answers back."""
 
 import json
 
@@ -18,19 +19,20 @@ from .question_types import (
     LABELS,
     Option,
     Question,
-    StructuredDecisionError,
-    argmax,
+    get_question_type,
+    make_question,
 )
-from .question_types import (
-    ChoiceQuestion as LabelQuestion,
-)
+
+QUESTION_TYPE_NAMES = {"predicate": "noul", "choice": "choice", "score": "score"}
 
 
 def make_read_question(
     index: int, question: DecisionQuestion, max_options: int = len(LABELS)
 ) -> Question:
+    qid = str(index)
+    qtype = get_question_type(QUESTION_TYPE_NAMES[question.type])
     if isinstance(question, PredicateQuestion):
-        options = [Option("false"), Option("true")]
+        options = qtype.parse_options(qid, None)
     elif isinstance(question, ChoiceQuestion):
         options = [
             Option(json.dumps(c.value, ensure_ascii=False), c.description)
@@ -38,45 +40,40 @@ def make_read_question(
         ]
     else:
         options = [Option(level.label, level.description) for level in question.levels]
-    limit = min(max_options, len(LABELS))
-    if len(options) > limit:
-        raise StructuredDecisionError(
-            f"This model supports at most {limit} choices per question"
-        )
-    return Question(
-        id=str(index),
-        type=LabelQuestion(),
-        instructions=question.instructions,
-        options=tuple(options),
-        labels=LABELS[: len(options)],
-    )
+    return make_question(qid, qtype, question.instructions, options, max_options)
 
 
 def make_answer(
-    question: DecisionQuestion, probs: list[float], label_mass: float
+    question: DecisionQuestion,
+    read_question: Question,
+    probs: list[float],
+    label_mass: float,
 ) -> DecisionAnswer:
+    answer = read_question.type.answer(read_question, probs, label_mass)
     if isinstance(question, PredicateQuestion):
-        return PredicateAnswer(name=question.name, probability=probs[1])
-    top = argmax(probs)
-    confidence = probs[top] * label_mass
+        return PredicateAnswer(name=question.name, probability=answer["noul"])
     if isinstance(question, ChoiceQuestion):
+        values = [choice.value for choice in question.choices]
+        names = [option.name for option in read_question.options]
         return ChoiceAnswer(
             name=question.name,
-            choice=question.choices[top].value,
+            choice=values[names.index(answer["choice"])],
             probabilities=[
-                {"value": choice.value, "probability": probability}
-                for choice, probability in zip(question.choices, probs)
+                {"value": value, "probability": probability}
+                for value, probability in zip(values, answer["probabilities"].values())
             ],
-            confidence=confidence,
+            confidence=answer["confidence"],
         )
     return ScoreAnswer(
         name=question.name,
-        score=sum(i * probability for i, probability in enumerate(probs)),
+        score=answer["score"],
         probabilities=[
-            {"value": i, "label": level.label, "probability": probability}
-            for i, (level, probability) in enumerate(zip(question.levels, probs))
+            {"value": int(i), "label": level.label, "probability": probability}
+            for (i, probability), level in zip(
+                answer["probabilities"].items(), question.levels
+            )
         ],
-        confidence=confidence,
+        confidence=answer["confidence"],
     )
 
 

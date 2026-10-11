@@ -438,3 +438,41 @@ def test_prompts_retain_question_order(decision_server):
     assert response.status_code == 200, response.text
     for i, prompt in enumerate(server.engine.generated):
         assert f"Question {i}" in server.tokenizer.decode(prompt["prompt_token_ids"])
+
+
+def test_decisions_and_systemone_read_the_same_prompts(decision_server):
+    server = decision_server
+    levels = ["low", "high"]
+    decisions = server.client.post(
+        "/v1/decisions",
+        json=dict(
+            model="test-model",
+            input="evidence",
+            questions=[
+                {"type": "predicate", "instructions": "Is it broken?"},
+                {
+                    "type": "score",
+                    "instructions": "Rate it.",
+                    "levels": [{"label": level} for level in levels],
+                },
+            ],
+        ),
+    )
+    systemone = server.client.post(
+        "/v1/systemone",
+        json=dict(
+            model="test-model",
+            state="evidence",
+            questions={
+                "broken": {"type": "noul", "instructions": "Is it broken?"},
+                "rating": {
+                    "type": "score",
+                    "instructions": "Rate it.",
+                    "criteria": levels,
+                },
+            },
+        ),
+    )
+    assert decisions.status_code == systemone.status_code == 200
+    prompts = [p["prompt_token_ids"] for p in server.engine.generated]
+    assert prompts[:2] == prompts[2:]

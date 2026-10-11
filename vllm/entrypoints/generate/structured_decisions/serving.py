@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import asyncio
 import json
-from collections.abc import Mapping
 from typing import Any
 
 from fastapi import Request
@@ -15,11 +13,6 @@ from vllm.entrypoints.openai.decisions.question_types import (
 from vllm.entrypoints.openai.decisions.serving import BaseServingDecisions
 from vllm.entrypoints.openai.decisions.strategies import DecisionLimits
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
-from vllm.tracing import (
-    contains_trace_headers,
-    extract_trace_headers,
-    log_tracing_disabled_warning,
-)
 
 from .protocol import (
     DecisionUsage,
@@ -62,69 +55,39 @@ def parse_questions(
 
 
 class ServingStructuredDecisions(BaseServingDecisions):
-    async def _get_trace_headers(
-        self, headers: Mapping[str, str]
-    ) -> Mapping[str, str] | None:
-        if not contains_trace_headers(headers):
-            return None
-        if not await self.strategy.context.engine_client.is_tracing_enabled():
-            log_tracing_disabled_warning()
-            return None
-        return extract_trace_headers(headers)
-
     async def create_decision(
         self,
         request: StructuredDecisionRequest,
         raw_request: Request | None = None,
     ) -> StructuredDecisionResponse | ErrorResponse:
-        if (error := await self._check_model(request)) is not None:  # type: ignore[arg-type]
-            return error
-        engine_client = self.strategy.context.engine_client
-        if engine_client.errored:
-            raise engine_client.dead_error
-
-        base_id = self._base_request_id(raw_request, default=request.request_id)
-        request_id = f"decision-{base_id}"
-        try:
-            questions = parse_questions(request, self.limits)
-            lora_request = self._maybe_get_adapters(request)  # type: ignore[arg-type]
-            engine_client.check_admission(len(questions))
-            text = state_text(request.state)
-            trace_headers = (
-                None
-                if raw_request is None
-                else await self._get_trace_headers(raw_request.headers)
-            )
-            reads = await self.strategy.read(
-                questions,
-                request.instructions,
-                text,
-                request_id=request_id,
-                chat_template_kwargs=request.chat_template_kwargs,
-                lora_request=lora_request,
-                priority=request.priority,
-                cache_salt=request.cache_salt,
-                trace_headers=trace_headers,
-            )
-        except StructuredDecisionError as e:
-            return self.create_error_response(e)
-        except asyncio.CancelledError:
-            return self.create_error_response("Client disconnected")
+        result = await self._read(
+            request,
+            raw_request,
+            lambda: parse_questions(request, self.limits),
+            state_text(request.state),
+            instructions=request.instructions,
+            chat_template_kwargs=request.chat_template_kwargs,
+            priority=request.priority,
+            cache_salt=request.cache_salt,
+            default_request_id=request.request_id,
+        )
+        if isinstance(result, ErrorResponse):
+            return result
 
         answers: dict[str, dict[str, Any]] = {}
         diagnostics: dict[str, QuestionDiagnostics] = {}
-        for q, read in zip(questions, reads):
+        for q, read in zip(result.questions, result.reads):
             answers[q.id] = q.type.answer(q, read.probs, read.label_mass)
             diagnostics[q.id] = QuestionDiagnostics(
                 label_mass=read.label_mass, argmax_is_label=read.argmax_is_label
             )
         return StructuredDecisionResponse(
-            id=request_id,
-            model=self.models.model_name(lora_request),
+            id=result.request_id,
+            model=result.model_name,
             answers=answers,
             usage=DecisionUsage(
-                input_tokens=sum(r.input_tokens for r in reads),
-                output_tokens=sum(r.output_tokens for r in reads),
+                input_tokens=sum(r.input_tokens for r in result.reads),
+                output_tokens=sum(r.output_tokens for r in result.reads),
             ),
             diagnostics=diagnostics,
         )

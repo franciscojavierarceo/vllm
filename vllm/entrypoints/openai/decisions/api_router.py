@@ -6,9 +6,6 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
-from vllm.entrypoints.serve.exception_handling.error_response import (
-    create_error_response,
-)
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     validate_json_request,
@@ -42,10 +39,7 @@ async def create_decision(request: DecisionRequest, raw_request: Request):
         raw_request.app.state, "openai_serving_decisions", None
     )
     if handler is None:
-        error = create_error_response(
-            NotImplementedError("The model does not support the Decisions API")
-        )
-        return JSONResponse(content=error.model_dump(), status_code=error.error.code)
+        raise NotImplementedError("The model does not support the Decisions API")
     result = await handler.create_decisions(request, raw_request)
     if isinstance(result, ErrorResponse):
         return JSONResponse(content=result.model_dump(), status_code=result.error.code)
