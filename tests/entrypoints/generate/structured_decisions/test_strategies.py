@@ -35,6 +35,7 @@ from vllm.entrypoints.generate.structured_decisions.serving import (
 from vllm.entrypoints.openai.decisions.api_router import register_decisions_api_router
 from vllm.entrypoints.openai.decisions.question_types import (
     LABELS,
+    Question,
     StructuredDecisionError,
     build_question,
 )
@@ -508,7 +509,11 @@ def test_joint_schema_truncates_the_state(joint_schema):
     serving, _, _ = joint_schema
     strategy = serving.strategy
     request = StructuredDecisionRequest(**JOINT_SCHEMA_REQUEST)
-    questions = parse_questions(request, strategy.limits())
+    questions = [
+        q
+        for q in parse_questions(request, strategy.limits())
+        if isinstance(q, Question)
+    ]
     prompt, schema, _ = strategy.encode(questions, "word " * 100)
     strategy.max_length = len(prompt) - 50
     truncated, truncated_schema, _ = strategy.encode(questions, "word " * 100)
@@ -1391,6 +1396,210 @@ def test_image_request_to_unsupported_model_fails_before_generation(
     assert response.status_code == 400
     assert "does not support image input" in response.json()["error"]["message"]
     assert not server.engine.generated
+
+
+@pytest.fixture
+def box_server(decision_server, monkeypatch):
+    server = decision_server
+    server.engine.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+    server.engine.model_config.is_multimodal_model = True
+    server.engine.model_config.logprobs_mode = "raw_logprobs"
+    server.engine.model_config.max_model_len = 8192
+    server.engine.box_text = '{"bbox_2d": [100, 200, 700, 900]}'
+    server.box_calls = []
+    server.box_renders = []
+    server.fetch = AsyncMock(return_value=Image.new("RGB", (100, 50)))
+    strategy = server.client.app.state.serving_structured_decisions.strategy
+    strategy.__dict__["_connector"] = SimpleNamespace(fetch_image_async=server.fetch)
+    original_generate = server.engine.generate
+    original_render = server.renderer.preprocess_chat
+
+    async def generate(prompt, params, request_id, **kwargs):
+        server.box_calls.append((params, request_id, kwargs))
+        if params.logprob_token_ids is not None:
+            async for result in original_generate(prompt, params, request_id, **kwargs):
+                yield result
+            return
+        server.engine.generated.append(prompt)
+        if server.engine.failure == "no_result":
+            return
+        ids = server.tokenizer.encode(server.engine.box_text, add_special_tokens=False)
+        output = CompletionOutput(
+            index=0,
+            text=server.engine.box_text,
+            token_ids=ids,
+            cumulative_logprob=None
+            if server.engine.failure == "no_logprobs"
+            else len(ids) * math.log(0.8),
+            logprobs=None,
+            finish_reason=server.engine.failure
+            if server.engine.failure in {"error", "length"}
+            else "stop",
+        )
+        yield RequestOutput(
+            request_id=request_id,
+            prompt=None,
+            prompt_token_ids=prompt["prompt_token_ids"],
+            prompt_logprobs=None,
+            outputs=[] if server.engine.failure == "no_output" else [output],
+            finished=True,
+        )
+
+    async def render(request, messages, **kwargs):
+        server.box_renders.append((request, messages, kwargs))
+        texts = [
+            {
+                **message,
+                "content": "".join(p.get("text", "[image]") for p in message["content"])
+                if isinstance(message["content"], list)
+                else message["content"],
+            }
+            for message in messages
+        ]
+        result = await original_render(request, texts, **kwargs)
+        if request.cache_salt is not None:
+            result[1][0]["cache_salt"] = request.cache_salt
+        return result
+
+    monkeypatch.setattr(server.engine, "generate", generate)
+    monkeypatch.setattr(server.renderer, "preprocess_chat", render)
+    return server
+
+
+def box_body():
+    return {
+        "model": "test-model",
+        "state": "A target in the image.",
+        "images": ["https://example.com/image.png"],
+        "questions": {"target": {"type": "box", "instructions": "the red rectangle"}},
+    }
+
+
+def test_boxes_and_decisions_share_one_image_and_keep_question_order(box_server):
+    server = box_server
+    body = box_body()
+    body.update(cache_salt="tenant-a", priority=7)
+    body["questions"].update(
+        present={"type": "noul", "instructions": "Is the target visible?"},
+        second={"type": "box", "instructions": "the blue circle"},
+    )
+    response = server.client.post("/v1/systemone", json=body, headers=TRACE_HEADERS)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert list(result["answers"]) == ["target", "present", "second"]
+    assert result["answers"]["target"] == {
+        "type": "box",
+        "box": {"left": 0.1, "top": 0.2, "right": 0.7, "bottom": 0.9},
+        "confidence": pytest.approx(0.8),
+    }
+    assert list(result["diagnostics"]) == ["present"]
+    assert result["usage"]["output_tokens"] > 2
+    assert server.engine.admitted == [3]
+    assert len(server.engine.generated) == 3
+    server.fetch.assert_awaited_once()
+    assert all(p["cache_salt"] == "tenant-a" for p in server.engine.generated)
+    assert len({call[1] for call in server.box_calls}) == 3
+    assert all(call[2]["priority"] == 7 for call in server.box_calls)
+    assert all(call[2]["trace_headers"] == TRACE_HEADERS for call in server.box_calls)
+    for _, _, kwargs in server.box_renders:
+        assert kwargs["skip_mm_cache"] is True
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"images": []}, "exactly one image"),
+        ({"images": ["one", "two"]}, "exactly one image"),
+        ({"criteria": {}}, "do not take criteria"),
+        ({"instructions": " "}, "target instructions"),
+        ({"architecture": "Qwen3ForCausalLM"}, "Qwen3.5 vision"),
+        ({"logprobs_mode": "processed_logprobs"}, "raw_logprobs"),
+        ({"chat_template_kwargs": {"enable_thinking": True}}, "thinking must be off"),
+    ],
+)
+def test_invalid_box_requests_fail_before_download_or_generation(
+    box_server, change, message
+):
+    server = box_server
+    body = box_body()
+    for key, value in change.items():
+        if key in {"criteria", "instructions"}:
+            body["questions"]["target"][key] = value
+        elif key in {"architecture", "logprobs_mode"}:
+            setattr(server.engine.model_config, key, value)
+        else:
+            body[key] = value
+    response = server.client.post("/v1/systemone", json=body)
+    assert response.status_code == 400, response.text
+    assert message in response.json()["error"]["message"]
+    assert not server.engine.generated
+    server.fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"bbox_2d": [200, 100, 100, 900]}',
+        '{"bbox_2d": [100, 100, 100, 900]}',
+        '{"bbox_2d": [0, 0, 1001, 900]}',
+        '{"bbox_2d": [-1, 0, 900, 900]}',
+        '{"bbox_2d": [true, 0, 900, 900]}',
+        '{"bbox_2d": [0, 0, 900]}',
+        '{"bbox_2d": [0, 0, 900, 900], "other": 1}',
+        '{"bbox_2d": [',
+    ],
+)
+def test_invalid_model_boxes_are_errors_instead_of_fabricated_coordinates(
+    box_server, text
+):
+    box_server.engine.box_text = text
+    response = box_server.client.post("/v1/systemone", json=box_body())
+    assert response.status_code == 500, response.text
+    assert "Invalid Box coordinates" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "failure", ["no_result", "no_output", "no_logprobs", "error", "length"]
+)
+def test_failed_box_reads_return_generation_errors(box_server, failure):
+    box_server.engine.failure = failure
+    response = box_server.client.post("/v1/systemone", json=box_body())
+    assert response.status_code == 500, response.text
+
+
+def test_adding_box_preserves_classification_prompt_with_string_templates(box_server):
+    server = box_server
+    strategy = server.client.app.state.serving_structured_decisions.strategy
+    strategy.context.chat_template_content_format = "string"
+    body = box_body()
+    box = body["questions"].pop("target")
+    body["questions"]["present"] = {"type": "noul", "instructions": "Is it visible?"}
+    first = server.client.post("/v1/systemone", json=body)
+    assert first.status_code == 200, first.text
+    before = server.box_renders[0][1]
+    body["questions"]["target"] = box
+    second = server.client.post("/v1/systemone", json=body)
+    assert second.status_code == 200, second.text
+    assert server.box_renders[-1][1] == before
+    assert server.engine.generated[1] == server.engine.generated[0]
+
+
+def test_box_context_budget_is_checked_before_any_mixed_request_generation(box_server):
+    server = box_server
+    body = box_body()
+    first = server.client.post("/v1/systemone", json=body)
+    assert first.status_code == 200, first.text
+    prompt_len = len(server.engine.generated[0]["prompt_token_ids"])
+    server.engine.generated.clear()
+    body["questions"]["present"] = {"type": "noul", "instructions": "Is it visible?"}
+    server.engine.model_config.max_model_len = prompt_len + 127
+    rejected = server.client.post("/v1/systemone", json=body)
+    assert rejected.status_code == 400, rejected.text
+    assert "leave 128 tokens" in rejected.json()["error"]["message"]
+    assert not server.engine.generated
+    server.engine.model_config.max_model_len = prompt_len + 128
+    accepted = server.client.post("/v1/systemone", json=body)
+    assert accepted.status_code == 200, accepted.text
 
 
 @pytest.mark.parametrize("text_first", [False, True])

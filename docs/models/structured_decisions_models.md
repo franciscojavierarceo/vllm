@@ -32,7 +32,7 @@ used for classification and routing.
 ### TypeSafe System One Endpoint
 
 The `/v1/systemone` endpoint answers a set of typed questions about a state and
-returns a probability for every allowed answer.
+returns probabilities for classification questions and coordinates for Box questions.
 
 The endpoint is available by default on generation models. Models without a
 supported read strategy return 501. Supported architectures require
@@ -40,6 +40,8 @@ supported read strategy return 501. Supported architectures require
 log probabilities.
 
 #### How it works
+
+For `choice`, `noul` and `score` questions:
 
 1. Each question is one read. The user message is the state, followed by the
    question and its options with the type's labels, and an instruction to
@@ -67,6 +69,7 @@ question prefills only its own text, then reads one token.
 | `choice` | map of option name to a description or `null` | `choice`, `probabilities` by option name, `confidence` |
 | `noul` | `null`, or an object with optional `true` and `false` descriptions | `noul` (probability of yes), `probabilities`, `confidence` |
 | `score` | ordered list of level names | `score` (expected 0-indexed level), `legend`, `probabilities` by level index, `confidence` |
+| `box` | `null` | normalized `box` edges and decoding `confidence` ([Box questions](#box-questions)) |
 
 A choice has at least one option, a score at least two levels. A question id
 is a non-empty string.
@@ -144,8 +147,9 @@ Response, with probabilities that depend on the model:
 
 `diagnostics.label_mass` is the probability the model put on the labels across
 its whole vocabulary. A low value means most of the probability went to tokens
-that are not labels. `confidence` is the chosen option's probability over the
-whole vocabulary: its share of the labels times `label_mass`.
+that are not labels. `confidence` for classification questions is the chosen
+option's probability over the whole vocabulary: its share of the labels times
+`label_mass`.
 
 #### Labels
 
@@ -178,6 +182,49 @@ rejected with a 400.
 When [tracing](../../examples/observability/opentelemetry/README.md) is enabled
 with `--otlp-traces-endpoint`, the HTTP `traceparent` and `tracestate` headers are
 forwarded to every question's generation request.
+
+For Qwen3.5 image requests on vllm-metal builds without device normalization,
+start the server with `--no-mm-device-do-normalize` so the image processor
+rescales and normalizes pixels on the host.
+
+#### Box questions
+
+On Qwen3.5 vision generation models, `/v1/systemone` also accepts `box`
+questions to locate one target. Supply exactly one image for the request and
+describe the target in `instructions`; Box questions take no `criteria`.
+
+```json
+{
+  "model": "Qwen/Qwen3.5-4B",
+  "state": "Inspect the attached image.",
+  "images": ["https://example.org/photo.png"],
+  "questions": {
+    "mug": {"type": "box", "instructions": "the coffee mug"},
+    "visible": {"type": "noul", "instructions": "Is a coffee mug visible?"}
+  }
+}
+```
+
+A Box answer contains `type: "box"`, `box: {left, top, right, bottom}` and
+`confidence`. The edges are fractions of the image dimensions, measured from
+the top-left corner, with `left < right` and `top < bottom`. Multiply horizontal
+edges by image width and vertical edges by image height to draw the rectangle.
+
+Box uses constrained coordinate generation, with up to 128 output tokens per
+question. The prompt must leave room for all 128 tokens in the model context.
+It can be mixed with ordinary questions, retaining question order
+and sharing the same image. Image placement follows the model's native
+processor. Box does not emit label diagnostics, and unsupported strategies,
+missing images or multiple images return 400. Invalid model coordinates return
+a generation error rather than a repaired or fabricated box.
+
+Use `--logprobs-mode raw_logprobs`. Box `confidence` is the geometric mean of
+the generated-token probabilities reported by the engine under its decoding
+constraints. It is an uncalibrated decoding-likelihood measure; it does not
+estimate box overlap or object presence. Check presence with a separate `noul`
+question when the target might be absent. Validate localization on your images.
+Box is a `/v1/systemone` extension; `/v1/decisions` retains its existing question
+types. D3, Winnow, Liquid and DiffusionGemma do not support this Box read path.
 
 ### OpenAI Decisions API
 

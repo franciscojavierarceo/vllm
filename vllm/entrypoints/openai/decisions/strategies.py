@@ -13,7 +13,7 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from copy import copy, deepcopy
+from copy import copy
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, ClassVar, TypeVar
@@ -366,7 +366,10 @@ class NextTokenStrategy(ReadStrategy):
                 or not ctx.engine_client.model_config.is_multimodal_model
             ):
                 raise StructuredDecisionError("This model does not support image input")
-            state = deepcopy(state)
+            state = [
+                {**message, "content": [dict(part) for part in message["content"]]}
+                for message in state
+            ]
             parts = [part for message in state for part in message["content"]]
             images = iter(
                 await self._image_parts(
@@ -396,14 +399,14 @@ class NextTokenStrategy(ReadStrategy):
                     {**message, "content": list(message["content"])}
                     for message in state
                 ]
-                messages[-1]["content"].append(
-                    {
-                        "type": "text",
-                        "text": self._question_suffix(q)
-                        if has_state_text
-                        else self._content("", q),
-                    }
+                suffix = (
+                    self._question_suffix(q) if has_state_text else self._content("", q)
                 )
+                content = messages[-1]["content"]
+                if content and content[-1]["type"] == "text":
+                    content[-1] = {**content[-1], "text": content[-1]["text"] + suffix}
+                else:
+                    content.append({"type": "text", "text": suffix})
             if instructions:
                 messages.insert(0, {"role": "system", "content": instructions})
             engine_input, prompt_ids = await self._render(read_request, messages)

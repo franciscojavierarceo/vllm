@@ -13,7 +13,9 @@ from vllm.entrypoints.openai.decisions.question_types import (
 from vllm.entrypoints.openai.decisions.serving import BaseServingDecisions
 from vllm.entrypoints.openai.decisions.strategies import DecisionLimits
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.inputs import EngineInput
 
+from .box import BoxQuestion, box_strategy, read_boxes, render_boxes
 from .protocol import (
     DecisionUsage,
     QuestionDiagnostics,
@@ -25,19 +27,32 @@ from .protocol import (
 def parse_questions(
     request: StructuredDecisionRequest,
     limits: DecisionLimits,
-) -> list[Question]:
+) -> list[Question | BoxQuestion]:
     if not request.questions:
         raise StructuredDecisionError("questions: needs at least one question")
     if len(request.questions) > limits.max_questions:
         raise StructuredDecisionError(
             f"questions: at most {limits.max_questions} for this model"
         )
-    questions = []
+    questions: list[Question | BoxQuestion] = []
     for qid, spec in request.questions.items():
         if spec.model_extra:
             raise StructuredDecisionError(
                 f"question {qid!r}: unknown field(s) {sorted(spec.model_extra)}"
             )
+        if spec.type == "box":
+            if (
+                not qid
+                or not isinstance(spec.instructions, str)
+                or not spec.instructions.strip()
+            ):
+                raise StructuredDecisionError(
+                    "Box questions need a nonempty id and target instructions"
+                )
+            if spec.criteria is not None:
+                raise StructuredDecisionError("Box questions do not take criteria")
+            questions.append(BoxQuestion(qid, spec.instructions))
+            continue
         questions.append(
             build_question(
                 qid,
@@ -80,24 +95,72 @@ class ServingStructuredDecisions(BaseServingDecisions):
         try:
             questions = parse_questions(request, self.limits)
             media = self._media(request)
+            labels = [q for q in questions if isinstance(q, Question)]
+            boxes = [q for q in questions if isinstance(q, BoxQuestion)]
+            grounding = (
+                box_strategy(self.strategy, request.images or []) if boxes else None
+            )
+            box_request = (
+                grounding._read_request(
+                    request.chat_template_kwargs, request.cache_salt
+                )
+                if grounding is not None
+                else None
+            )
             lora_request = self._maybe_get_adapters(request)  # type: ignore[arg-type]
-            engine_client.check_admission(self.strategy.num_requests(questions))
+            engine_client.check_admission(
+                (self.strategy.num_requests(labels) if labels else 0) + len(boxes)
+            )
             trace_headers = (
                 None
                 if raw_request is None
                 else await self._get_trace_headers(raw_request.headers)
             )
-            reads = await self.strategy.read(
-                questions,
-                request.instructions,
-                self.strategy.render_state(request.state),
-                request_id=request_id,
-                chat_template_kwargs=request.chat_template_kwargs,
-                lora_request=lora_request,
-                priority=request.priority,
-                cache_salt=request.cache_salt,
-                trace_headers=trace_headers,
-                media=media,
+            state: str | list[dict[str, Any]] = self.strategy.render_state(
+                request.state
+            )
+            box_inputs: list[EngineInput] = []
+            if grounding is not None:
+                assert box_request is not None
+                images = await grounding._image_parts(request.images or [])
+                state = [
+                    {
+                        "role": "user",
+                        "content": [*images, {"type": "text", "text": state}],
+                    }
+                ]
+                box_inputs = await render_boxes(
+                    grounding, boxes, state, request.instructions, box_request
+                )
+                media = {}
+            reads = (
+                await self.strategy.read(
+                    labels,
+                    request.instructions,
+                    state,
+                    request_id=request_id,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    lora_request=lora_request,
+                    priority=request.priority,
+                    cache_salt=request.cache_salt,
+                    trace_headers=trace_headers,
+                    media=media,
+                )
+                if labels
+                else []
+            )
+            box_reads = (
+                await read_boxes(
+                    grounding,
+                    boxes,
+                    box_inputs,
+                    request_id=request_id,
+                    lora_request=lora_request,
+                    priority=request.priority,
+                    trace_headers=trace_headers,
+                )
+                if grounding is not None
+                else []
             )
         except StructuredDecisionError as e:
             return self.create_error_response(e)
@@ -106,20 +169,23 @@ class ServingStructuredDecisions(BaseServingDecisions):
 
         answers: dict[str, dict[str, Any]] = {}
         diagnostics: dict[str, QuestionDiagnostics] = {}
-        for q, read in zip(questions, reads):
+        for q, read in zip(labels, reads):
             answers[q.id] = q.type.answer(q, read.probs, read.label_mass)
             if read.confidence is not None:
                 answers[q.id]["confidence"] = read.confidence
             diagnostics[q.id] = QuestionDiagnostics(
                 label_mass=read.label_mass, argmax_is_label=read.argmax_is_label
             )
+        answers.update((q.id, read.answer) for q, read in zip(boxes, box_reads))
         return StructuredDecisionResponse(
             id=request_id,
             model=self.models.model_name(lora_request),
-            answers=answers,
+            answers={q.id: answers[q.id] for q in questions},
             usage=DecisionUsage(
-                input_tokens=sum(r.input_tokens for r in reads),
-                output_tokens=sum(r.output_tokens for r in reads),
+                input_tokens=sum(r.input_tokens for r in reads)
+                + sum(r.input_tokens for r in box_reads),
+                output_tokens=sum(r.output_tokens for r in reads)
+                + sum(r.output_tokens for r in box_reads),
             ),
             diagnostics=diagnostics,
         )
