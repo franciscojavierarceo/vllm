@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OpenAI Decisions API request and response models."""
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import ConfigDict, Field, StrictBool, StrictStr, model_validator
 

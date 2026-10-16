@@ -119,7 +119,12 @@ class WinnowStrategy(ReadStrategy):
         priority,
         cache_salt=None,
         trace_headers=None,
+        media=None,
     ):
+        if media:
+            raise StructuredDecisionError(
+                "Winnow images must be supplied as Decisions input_image parts"
+            )
         if instructions or chat_template_kwargs:
             raise StructuredDecisionError(
                 "Winnow uses a fixed trained prompt; chat overrides are unsupported"
@@ -165,6 +170,7 @@ class WinnowStrategy(ReadStrategy):
                     default_template=VISION_TEMPLATE,
                     default_template_content_format="openai",
                     default_template_kwargs={},
+                    skip_mm_cache=True,
                 )
                 engine_inputs.append(engine_input)
             prompts = [

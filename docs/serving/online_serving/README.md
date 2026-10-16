@@ -17,7 +17,7 @@ We currently support the following OpenAI APIs:
 - [Responses API](./openai_compatible_server.md#responses-api) (`/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/cancel`)
     - Only applicable to [text generation models](../../models/generative_models.md).
 - [Decisions API](../../models/structured_decisions_models.md#openai-decisions-api) (`/v1/decisions`)
-    - Supports text-only predicate, choice, and score questions on supported generation models.
+    - Supports predicate, choice, and score questions with text or image input on supported generation models.
 - [Embeddings API](../../models/pooling_models/embed.md#openai-compatible-embeddings-api) (`/v1/embeddings`)
     - Only applicable to [embedding models](../../models/pooling_models/embed.md).
 - [Transcriptions API](./speech_to_text.md#transcriptions-api) (`/v1/audio/transcriptions`)

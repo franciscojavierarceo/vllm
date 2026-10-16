@@ -797,7 +797,7 @@ class JointSchemaStrategy(ReadStrategy):
         self,
         questions: list[Question],
         instructions: str | None,
-        state: str,
+        state: str | list[dict[str, Any]],
         *,
         request_id: str,
         chat_template_kwargs: dict[str, Any] | None,
@@ -810,6 +810,10 @@ class JointSchemaStrategy(ReadStrategy):
         if instructions:
             raise StructuredDecisionError(
                 "this model reads a fixed prompt, so it takes no instructions"
+            )
+        if not isinstance(state, str):
+            raise StructuredDecisionError(
+                "this model needs a text state with media supplied separately"
             )
         engine_input: EngineInput
         if media:
@@ -1081,7 +1085,7 @@ class D3Strategy(ReadStrategy):
         self,
         questions: list[Question],
         instructions: str | None,
-        state: str,
+        state: str | list[dict[str, Any]],
         *,
         request_id: str,
         chat_template_kwargs: dict[str, Any] | None,
@@ -1094,6 +1098,10 @@ class D3Strategy(ReadStrategy):
         if instructions:
             raise StructuredDecisionError(
                 "this model reads a fixed prompt, so it takes no instructions"
+            )
+        if not isinstance(state, str):
+            raise StructuredDecisionError(
+                "this model needs a text state with media supplied separately"
             )
         placeholders = [
             modality

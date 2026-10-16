@@ -78,7 +78,7 @@ def test_openai_decisions_text_questions(server):
     assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
 
 
-def test_openai_decisions_rejects_images(server):
+def test_text_only_model_rejects_image_decisions(server):
     response = requests.post(
         server.url_for("v1/decisions"),
         json={
@@ -98,4 +98,4 @@ def test_openai_decisions_rejects_images(server):
         },
     )
     assert response.status_code == 400
-    assert "text input only" in response.json()["error"]["message"]
+    assert "does not support image input" in response.json()["error"]["message"]

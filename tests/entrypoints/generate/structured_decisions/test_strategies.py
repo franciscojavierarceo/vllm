@@ -1000,12 +1000,12 @@ def test_winnow_requires_explicit_protocol_and_raw_scores():
 
     config = model("Gemma4ForCausalLM")
     with pytest.raises(ValueError, match="does not support"):
-        select_read_strategy(config)
+        select_read_strategy(config, ("generate",))
     config.hf_config = SimpleNamespace(decision_read_strategy="winnow")
-    assert select_read_strategy(config) is WinnowStrategy
+    assert select_read_strategy(config, ("generate",)) is WinnowStrategy
     config.logprobs_mode = "processed_logprobs"
     with pytest.raises(ValueError, match="raw_logprobs"):
-        select_read_strategy(config)
+        select_read_strategy(config, ("generate",))
 
 
 def test_winnow_option_strings_preserve_trained_semantics():
@@ -1041,7 +1041,10 @@ def test_winnow_option_strings_preserve_trained_semantics():
     assert make_read_question(2, score).winnow_options == ("bad", "good")
 
 
-def test_winnow_route_uses_independent_fixed_prompts(decision_server, monkeypatch):
+@pytest.mark.parametrize("endpoint", ["/v1/decisions", "/v1/systemone"])
+def test_winnow_route_uses_independent_fixed_prompts(
+    decision_server, monkeypatch, endpoint
+):
     from vllm.entrypoints.openai.decisions.winnow import WinnowStrategy
 
     server = decision_server
@@ -1052,7 +1055,8 @@ def test_winnow_route_uses_independent_fixed_prompts(decision_server, monkeypatc
         ReadContext(server.engine, server.renderer, None, "auto", {})
     )
     server.client.app.state.openai_serving_decisions.strategy = strategy
-    body = {
+    server.client.app.state.serving_structured_decisions.strategy = strategy
+    body: dict[str, Any] = {
         "model": "test-model",
         "input": "Evidence",
         "questions": [
@@ -1071,9 +1075,33 @@ def test_winnow_route_uses_independent_fixed_prompts(decision_server, monkeypatc
             },
         ],
     }
-    response = server.client.post("/v1/decisions", json=body)
+    if endpoint == "/v1/systemone":
+        body = {
+            "model": "test-model",
+            "state": "Evidence",
+            "questions": {
+                "valid": {"type": "noul", "instructions": "Is it valid?"},
+                "route": {
+                    "type": "choice",
+                    "instructions": "Route?",
+                    "criteria": {"a": None, "b": None},
+                },
+                "rating": {
+                    "type": "score",
+                    "instructions": "Rate?",
+                    "criteria": ["low", "high"],
+                },
+            },
+        }
+    response = server.client.post(endpoint, json=body)
     assert response.status_code == 200, response.text
-    assert [answer["name"] for answer in response.json()["answers"]] == [
+    answers = response.json()["answers"]
+    names = (
+        list(answers)
+        if endpoint == "/v1/systemone"
+        else [answer["name"] for answer in answers]
+    )
+    assert names == [
         "valid",
         "route",
         "rating",
