@@ -108,6 +108,8 @@ class ServingStructuredDecisions(BaseServingDecisions):
         diagnostics: dict[str, QuestionDiagnostics] = {}
         for q, read in zip(questions, reads):
             answers[q.id] = q.type.answer(q, read.probs, read.label_mass)
+            if read.confidence is not None:
+                answers[q.id]["confidence"] = read.confidence
             diagnostics[q.id] = QuestionDiagnostics(
                 label_mass=read.label_mass, argmax_is_label=read.argmax_is_label
             )

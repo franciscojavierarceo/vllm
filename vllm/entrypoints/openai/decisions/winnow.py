@@ -46,7 +46,7 @@ def prompt_segments(tokenizer, state, question):
     suffix = "\nQuestion: " + data_text(question.instructions) + "\nOptions:\n"
     suffix += "".join(
         label + ": " + data_text(option) + "\n"
-        for label, option in zip(question.labels, options)
+        for label, option in zip(LABELS, options)
     )
     suffix += "Return the correct letter label.<turn|>\n<|turn>model\n"
     template = tokenizer.chat_template
@@ -100,7 +100,12 @@ class WinnowStrategy(ReadStrategy):
         self.state_format = getattr(config, "decision_state_format", "text")
         if self.state_format not in {"text", "json"}:
             raise ValueError("decision_state_format must be text or json")
-        self.temperature = getattr(config, "decision_temperature", 1.0)
+        try:
+            self.temperature = float(getattr(config, "decision_temperature", 1.0))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                "decision_temperature must be finite and positive"
+            ) from exc
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("decision_temperature must be finite and positive")
 
@@ -135,12 +140,18 @@ class WinnowStrategy(ReadStrategy):
                 raise StructuredDecisionError(
                     "This text-only Winnow export does not support image input"
                 )
-            images = [
-                part
-                for message in state
-                for part in message["content"]
-                if part["type"] == "image_url"
-            ]
+            urls = []
+            seen_text = False
+            for message in state:
+                for part in message["content"]:
+                    if part["type"] == "image_url":
+                        if seen_text:
+                            raise StructuredDecisionError(
+                                "Winnow requires images before all text content"
+                            )
+                        urls.append(part["image_url"]["url"])
+                    elif part["text"].strip():
+                        seen_text = True
             state = "\n\n".join(
                 "\n".join(
                     part["text"]
@@ -149,6 +160,7 @@ class WinnowStrategy(ReadStrategy):
                 )
                 for message in state
             )
+            images = await self._image_parts(urls)
         if self.state_format == "json":
             try:
                 state = json.loads(state)

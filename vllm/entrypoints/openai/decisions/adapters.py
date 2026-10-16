@@ -59,7 +59,10 @@ def make_read_question(
             for c in question.choices
         )
     else:
-        winnow_options = tuple(level.label for level in question.levels)
+        winnow_options = tuple(
+            level.label + (": " + level.description if level.description else "")
+            for level in question.levels
+        )
     return Question(
         id=str(index),
         type=LabelQuestion(),
@@ -126,20 +129,20 @@ def input_state(input: str | list[DecisionInputMessage]) -> str | list[dict[str,
         for part in message.content
     ):
         return input_text(input)
-    messages = []
-    for message in input:
-        content: list[dict[str, Any]]
+    content: list[dict[str, Any]] = []
+    for index, message in enumerate(input):
+        if index:
+            content.append({"type": "text", "text": "\n\n"})
         if isinstance(message.content, str):
-            content = [{"type": "text", "text": message.content}]
+            content.append({"type": "text", "text": message.content})
         else:
-            content = [
+            content.extend(
                 {
                     "type": "image_url",
-                    "image_url": {"url": part.image_url, "detail": part.detail},
+                    "image_url": {"url": part.image_url},
                 }
                 if isinstance(part, DecisionInputImage)
                 else {"type": "text", "text": part.text}
                 for part in message.content
-            ]
-        messages.append({"role": "user", "content": content})
-    return messages
+            )
+    return [{"role": "user", "content": content}]

@@ -29,7 +29,7 @@ class DecisionInputImage(DecisionModel):
         StrictStr,
         Field(max_length=20971520, pattern=r"^(https?://|data:image/).+"),
     ]
-    detail: Literal["auto", "low", "high"] = "auto"
+    detail: Literal["auto", "low", "high", "original"] | None = "auto"
 
 
 DecisionInputPart = Annotated[

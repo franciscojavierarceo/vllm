@@ -252,7 +252,12 @@ def test_image_content_preserves_order_without_changing_text_only_input():
             "detail": "low",
         },
     ]
-    parsed = request(input=[{"role": "user", "content": parts}])
+    parsed = request(
+        input=[
+            {"role": "user", "content": parts},
+            {"role": "user", "content": "After"},
+        ]
+    )
     assert input_state(parsed.input) == [
         {
             "role": "user",
@@ -262,15 +267,34 @@ def test_image_content_preserves_order_without_changing_text_only_input():
                     "type": "image_url",
                     "image_url": {
                         "url": "https://example.com/one.png",
-                        "detail": "auto",
                     },
                 },
                 {"type": "text", "text": "Between"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,AA==", "detail": "low"},
+                    "image_url": {"url": "data:image/png;base64,AA=="},
                 },
+                {"type": "text", "text": "\n\n"},
+                {"type": "text", "text": "After"},
             ],
         }
     ]
     assert input_state(request(input="unchanged").input) == "unchanged"
+
+
+@pytest.mark.parametrize("detail", [None, "original"])
+def test_image_detail_accepts_upstream_values(detail):
+    request(
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": "https://example.com/image.png",
+                        "detail": detail,
+                    }
+                ],
+            }
+        ]
+    )

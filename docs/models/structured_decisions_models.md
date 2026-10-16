@@ -25,7 +25,7 @@ used for classification and routing.
 | `Lfm2VlForConditionalGeneration`     | T + I<sup>+</sup>                   | `LiquidStrategy`               | `generate`       | N/A               | `LiquidAI/d1-3B`                         |
 | `Qwen3_5ForConditionalGeneration`    | T + I<sup>E+</sup> + V<sup>E+</sup> | `NextTokenStrategy`            | `generate`       | N/A               | `Qwen/Qwen3.5-0.8B`, etc.                |
 | `Qwen3_5MoeForConditionalGeneration` | T + I<sup>E+</sup> + V<sup>E+</sup> | `NextTokenStrategy`            | `generate`       | N/A               | `Qwen/Qwen3.5-35B-A3B`, etc.             |
-| `DiffusionGemmaForBlockDiffusion`    | T + I<sup>+</sup> + V<sup>+</sup>   | `DiffusionGemmaCanvasStrategy` | `generate`       | N/A               | `google/diffusiongemma-26B-A4B-it`, etc. |
+| `DiffusionGemmaForBlockDiffusion`    | T                                   | `DiffusionGemmaCanvasStrategy` | `generate`       | N/A               | `google/diffusiongemma-26B-A4B-it`, etc. |
 
 ## Online Serving
 
@@ -252,8 +252,7 @@ is available by default.
 
 #### Winnow checkpoints
 
-Winnow-trained Gemma4 checkpoints use a fixed turn serialization and candidate
-labels rather than the generic chat prompt. Opt in explicitly:
+Winnow-trained Gemma4 checkpoints opt into their fixed prompt format with:
 
 ```bash
 vllm serve /path/to/winnow-checkpoint \
@@ -261,37 +260,21 @@ vllm serve /path/to/winnow-checkpoint \
   --logprobs-mode raw_logprobs --enable-prefix-caching
 ```
 
-This uses the shared Decisions API and label-read backend. Each question is
-scheduled independently with the same state prefix. Request-specific chat
-instructions or chat-template overrides are rejected. The upstream limits of
-64 questions and 26 options apply. The API's confidence and response schemas
-remain unchanged; they differ from Ollaya's Jev wire responses.
+An unrelated Gemma4 checkpoint does not become Winnow-trained through this
+setting. The checkpoint must work with the installed model and quantization
+loaders. Winnow supports 64 questions and 26 options per question, and rejects
+request-specific instructions and chat-template overrides.
 
-`decision_temperature` divides candidate log probabilities before their
-conditional softmax. Use 1 when the required scale is folded into the exported
-weights. An additional validation-fitted temperature in `calibration.json` is
-external: set `decision_temperature` to that value for that calibrated variant.
-Temperature changes conditional answer probabilities; `confidence` retains the
-winning label's original full-vocabulary probability from the engine read.
-Preserve the exported
-Gemma logit-softcap configuration. Loading an unrelated Gemma4 checkpoint does
-not make it Winnow-trained.
-
-The checkpoint must be compatible with the installed engine's model and
-quantization loaders. This strategy does not add or change model loaders.
-
-The Decisions API accepts text. For a checkpoint deployment that interprets
-input as a JSON state, set `decision_state_format` to `json` in `--hf-overrides`
-and send a JSON document as the `input` string. The strategy parses that document
-before applying Winnow's canonical state serialization. This preserves object
-and array states when comparing against Ollaya. The default `text` mode treats
-input literally. Invalid JSON in `json` mode fails before inference.
+`decision_temperature` divides candidate log probabilities before softmax;
+`confidence` retains the winning label's original full-vocabulary probability.
+Set `decision_state_format` to `json` when the checkpoint expects structured
+state, and send that state as a JSON document in the `input` string. The default
+`text` mode treats the input literally.
 
 #### Image input
 
-For a supported vision-language model, `/v1/decisions` accepts ordered user
-content with `input_text` and `input_image` parts. Image URLs use the existing
-vLLM multimodal renderer and its media restrictions and processor cache.
+For a supported vision-language generation model, `/v1/decisions` accepts
+ordered `input_text` and `input_image` parts:
 
 ```json
 {
@@ -304,54 +287,24 @@ vLLM multimodal renderer and its media restrictions and processor cache.
 }
 ```
 
-Each question retains the same ordered image/state prefix and its own question
-suffix. Model-specific processors expand image placeholders before inference;
-image metadata stays in the engine input. Context limits apply to the expanded
-input. Text-only models reject image requests.
+Images are fetched once per request through vLLM's media connector and processed
+by the model's native multimodal renderer. User messages are combined into one
+turn, preserving part order before the model's chat template is applied. Image
+placement follows that template; templates using string content may place
+images before text. Each question uses the strategy's question format.
+Context limits apply after image
+placeholder expansion. Text-only models reject images. Image URLs must use
+HTTP(S) or image data URLs and contain at most 20 MiB of text. `detail` is
+accepted for API compatibility; image resolution follows the local model's
+processor configuration rather than OpenAI's detail profiles.
 
-Winnow image input requires a native `Gemma4ForConditionalGeneration` export
-with the matching vision tower and projector. A text-only
-`Gemma4ForCausalLM` export cannot gain vision support by changing its architecture
-name. Winnow uses its fixed trained turns and image-attachment prefix through the
-Gemma multimodal renderer, rather than the generic decision chat prompt.
+DiffusionGemma canvas decisions currently reject image input.
 
-Implementation validation is in progress. CPU tests cover schema, ordered media
-at the renderer boundary, fixed Winnow image formatting and text regressions.
-These tests do not establish real image accuracy or quantized vision support;
-actual model and precision validation must accompany any support claim.
-
-#### Image compatibility checks
-
-The image API was exercised on native BF16 Winnow-derived Gemma4 and Qwen3.5
-conditional-generation exports with their frozen original vision weights. Each
-passed five requests covering predicate, choice and score questions, changed
-image content, swapped two-image order, and a repeated image after other inputs.
-Explicit CPU offload was used on a 12GB RTX4070; these are functional checks,
-not resident throughput or visual-quality benchmarks. Qwen used the generic
-chat read strategy, so this does not measure the trained plain decision prompt.
-
-With a compatible vision server already running, reproduce the generated-color
-checks using:
-
-```bash
-.venv/bin/python benchmarks/decision_models/check_images.py --model MODEL --output /tmp/image-check
-```
-
-The benchmark requires correct red/blue classification for its simple fixtures
-and repeated probabilities within 1e-6. It does not establish broad vision
-accuracy or image-specific calibration.
-
-Compact runtime evidence is in
-`benchmarks/decision_models/vision-verification.json`.
-
-On the refreshed API stack, Gemma passed the strict repeat check with prefix
-caching enabled. Qwen passed with `--disable-prefix-caching`; with caching
-enabled, all requests and color/order checks succeeded but repeated probabilities
-differed by up to 0.00128. Native renderer checks confirmed identical repeated
-token IDs and image hashes. This is a measured runtime limitation, not a claim of
-batch-invariant probabilities. `VLLM_BATCH_INVARIANT=1` was rejected by Qwen's
-`GDN_ATTN` backend in the tested runtime. Use the verified no-prefix-cache
-configuration when reproducing the strict Qwen repeat check.
+Winnow vision requires a native `Gemma4ForConditionalGeneration` export with its
+matching vision tower and projector. Its fixed attachment prefix requires all
+image parts before any text; interleaved or text-first image requests are
+rejected. Vision behavior and accuracy must be validated on the actual trained
+checkpoint; enabling the strategy alone does not establish model quality.
 
 ## Examples
 

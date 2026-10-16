@@ -13,7 +13,7 @@ import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any, ClassVar, TypeVar
@@ -23,6 +23,7 @@ from PIL import Image
 
 import vllm.envs as envs
 from vllm.config import ModelConfig
+from vllm.connections import MediaRequestDownloadBudget
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.label_reads import next_token_label_reads
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel
@@ -36,6 +37,7 @@ from vllm.multimodal.media import (
     MediaIO,
     VideoMediaIO,
 )
+from vllm.multimodal.media.base import MediaDecodedBudget
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import ChatParams, TokenizeParams, merge_kwargs
 from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
@@ -126,6 +128,7 @@ class ReadStrategy(ABC):
     task: ClassVar[SupportedTask] = "generate"
     #: The modalities a request may attach media of.
     modalities: ClassVar[frozenset[str]] = frozenset()
+    max_image_pixels: ClassVar[int | None] = None
 
     def __init__(self, context: ReadContext):
         self.context = context
@@ -150,6 +153,30 @@ class ReadStrategy(ABC):
     def num_requests(self, questions: list[Question]) -> int:
         """The engine requests a decision takes."""
         return len(questions)
+
+    async def _image_parts(self, urls: Sequence[str]) -> list[dict[str, Any]]:
+        """Fetch once so every question reads the same images."""
+        if not urls:
+            return []
+        try:
+            processor = self.context.online_renderer.renderer.get_mm_processor()
+            processor.info.validate_num_items("image", len(urls))
+            connector = copy(self._connector)
+            connector.decoded_budget = MediaDecodedBudget()
+            connector.download_budget = MediaRequestDownloadBudget()
+            results = await asyncio.gather(
+                *map(connector.fetch_image_async, urls), return_exceptions=True
+            )
+            images = []
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+                images.append(result)
+        except ValueError as e:
+            raise StructuredDecisionError(f"media: {e}") from e
+        if self.max_image_pixels is not None:
+            images = [cap_pixels(image, self.max_image_pixels) for image in images]
+        return [{"type": "image_pil", "image_pil": image} for image in images]
 
     @abstractmethod
     async def read(
@@ -226,8 +253,7 @@ class NextTokenStrategy(ReadStrategy):
     the reply's first token. The requests share the state. With prefix caching,
     it is prefilled once."""
 
-    #: Images are shrunk to at most this many pixels before the processor.
-    max_image_pixels: ClassVar[int | None] = None
+    modalities = frozenset({"image"})
 
     def __init__(self, context: ReadContext):
         super().__init__(context)
@@ -277,20 +303,10 @@ class NextTokenStrategy(ReadStrategy):
 
     def _content(self, state: str, question: Question) -> str:
         """The user turn: the state, then the question."""
-        return f"{state}\n\n{question.type.prompt(question)}"
+        return state + self._question_suffix(question)
 
-    async def _image_parts(self, urls: Sequence[str]) -> list[dict[str, Any]]:
-        """The images as chat content parts, fetched once so that every
-        question reads the same pictures."""
-        if not urls:
-            return []
-        try:
-            images = await asyncio.gather(*map(self._connector.fetch_image_async, urls))
-        except ValueError as e:
-            raise StructuredDecisionError(f"media: {e}") from e
-        if self.max_image_pixels is not None:
-            images = [cap_pixels(image, self.max_image_pixels) for image in images]
-        return [{"type": "image_pil", "image_pil": image} for image in images]
+    def _question_suffix(self, question: Question) -> str:
+        return "\n\n" + question.type.prompt(question)
 
     def limits(self) -> DecisionLimits:
         return DecisionLimits(max_questions=64, max_options=len(LABELS))
@@ -341,7 +357,31 @@ class NextTokenStrategy(ReadStrategy):
     ) -> list[QuestionRead]:
         ctx = self.context
         read_request = self._read_request(chat_template_kwargs, cache_salt)
+        if media and not ctx.engine_client.model_config.is_multimodal_model:
+            raise StructuredDecisionError("this model does not take image inputs")
         image_parts = await self._image_parts((media or {}).get("image", ()))
+        if not isinstance(state, str):
+            if (
+                "image" not in self.modalities
+                or not ctx.engine_client.model_config.is_multimodal_model
+            ):
+                raise StructuredDecisionError("This model does not support image input")
+            state = deepcopy(state)
+            parts = [part for message in state for part in message["content"]]
+            images = iter(
+                await self._image_parts(
+                    [p["image_url"]["url"] for p in parts if p["type"] == "image_url"]
+                )
+            )
+            for part in parts:
+                if part["type"] == "image_url":
+                    part.clear()
+                    part.update(next(images))
+        has_state_text = isinstance(state, str) or any(
+            part["type"] == "text" and part["text"].strip()
+            for message in state
+            for part in message["content"]
+        )
 
         slots, engine_inputs, params = [], [], []
         for q in questions:
@@ -352,13 +392,17 @@ class NextTokenStrategy(ReadStrategy):
                     content = [*image_parts, {"type": "text", "text": content}]
                 messages = [{"role": "user", "content": content}]
             else:
-                if not ctx.engine_client.model_config.is_multimodal_model:
-                    raise StructuredDecisionError(
-                        "This model does not support image input"
-                    )
-                messages = deepcopy(state)
+                messages = [
+                    {**message, "content": list(message["content"])}
+                    for message in state
+                ]
                 messages[-1]["content"].append(
-                    {"type": "text", "text": "\n\n" + q.type.prompt(q)}
+                    {
+                        "type": "text",
+                        "text": self._question_suffix(q)
+                        if has_state_text
+                        else self._content("", q),
+                    }
                 )
             if instructions:
                 messages.insert(0, {"role": "system", "content": instructions})
@@ -410,6 +454,8 @@ class NextTokenStrategy(ReadStrategy):
 class DiffusionGemmaCanvasStrategy(NextTokenStrategy):
     """DiffusionGemma. Each question is one read-only request with one denoising
     step."""
+
+    modalities = frozenset()
 
     THOUGHT = "<|channel>thought\n<channel|>"
     END_OF_TURN = "<turn|>"
@@ -533,6 +579,10 @@ class LiquidStrategy(NextTokenStrategy):
         return groups
 
     def _content(self, state: str, question: Question) -> str:
+        suffix = self._question_suffix(question)
+        return state + suffix if state else suffix.removeprefix("\n\n\nQUESTION:\n")
+
+    def _question_suffix(self, question: Question) -> str:
         q = question
         if q.type.name == "choice":
             lines = "\n".join(
@@ -560,8 +610,7 @@ class LiquidStrategy(NextTokenStrategy):
                 f"question {q.id!r}: this model does not answer {q.type.name!r} "
                 "questions"
             )
-        # A null state leaves the images, or the question alone, as the prompt.
-        return f"{state}\n\n\nQUESTION:\n{ask}" if state else ask
+        return f"\n\n\nQUESTION:\n{ask}"
 
 
 class JointSchemaStrategy(ReadStrategy):
@@ -1211,8 +1260,9 @@ def select_read_strategy(
             raise ValueError("Winnow requires a Gemma4 causal or multimodal model")
         if model_config.logprobs_mode != "raw_logprobs":
             raise ValueError("Winnow requires raw_logprobs")
-        return WinnowStrategy
-    strategy = READ_STRATEGIES.get(model_config.architecture)
+        strategy: type[ReadStrategy] | None = WinnowStrategy
+    else:
+        strategy = READ_STRATEGIES.get(model_config.architecture)
     if strategy is None:
         raise ValueError(
             "The structured decisions API does not support "

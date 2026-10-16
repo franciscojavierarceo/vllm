@@ -64,12 +64,12 @@ class OpenAIServingDecisions(BaseServingDecisions):
                 if raw_request is None
                 else await self._get_trace_headers(raw_request.headers)
             )
-            text = input_state(request.input)
+            state = input_state(request.input)
             self._log_inputs(request_id, input_text(request.input), None, lora_request)
             reads = await self.strategy.read(
                 questions,
                 None,
-                text,
+                state,
                 request_id=request_id,
                 chat_template_kwargs=None,
                 lora_request=lora_request,

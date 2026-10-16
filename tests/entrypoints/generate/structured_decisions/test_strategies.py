@@ -8,7 +8,7 @@ from argparse import Namespace
 from io import BytesIO
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import numpy as np
 import pybase64 as base64
@@ -833,6 +833,67 @@ def test_liquid_caps_images_like_the_checkpoint():
     assert NextTokenStrategy.max_image_pixels is None
 
 
+@pytest.mark.asyncio
+async def test_image_fetch_limits_apply_to_the_whole_request(monkeypatch):
+    strategy = object.__new__(NextTokenStrategy)
+    strategy.__dict__["_connector"] = MediaConnector()
+    strategy.context = SimpleNamespace(
+        online_renderer=SimpleNamespace(
+            renderer=SimpleNamespace(
+                get_mm_processor=lambda: SimpleNamespace(
+                    info=SimpleNamespace(validate_num_items=lambda *args: None)
+                )
+            )
+        )
+    )
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8)).save(buffer, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    monkeypatch.setenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "300")
+    with pytest.raises(StructuredDecisionError, match="decoded media exceeds"):
+        await strategy._image_parts([url, url])
+    assert len(await strategy._image_parts([url])) == 1
+
+
+@pytest.mark.asyncio
+async def test_image_count_is_rejected_before_fetching(decision_server, monkeypatch):
+    strategy = decision_server.client.app.state.openai_serving_decisions.strategy
+    fetch = AsyncMock()
+    strategy.__dict__["_connector"] = SimpleNamespace(fetch_image_async=fetch)
+
+    def validate(modality, count):
+        if modality == "image" and count > 1:
+            raise ValueError("at most one image")
+
+    monkeypatch.setattr(
+        decision_server.renderer.renderer,
+        "get_mm_processor",
+        lambda: SimpleNamespace(info=SimpleNamespace(validate_num_items=validate)),
+    )
+    with pytest.raises(StructuredDecisionError, match="at most one image"):
+        await strategy._image_parts(["one", "two"])
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_image_fetch_error_waits_for_sibling_fetches(decision_server):
+    strategy = decision_server.client.app.state.openai_serving_decisions.strategy
+    completed = []
+
+    async def fetch(url):
+        if url == "bad":
+            raise ValueError("invalid image")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        completed.append(url)
+        return Image.new("RGB", (8, 8))
+
+    strategy.__dict__["_connector"] = SimpleNamespace(fetch_image_async=fetch)
+    with pytest.raises(StructuredDecisionError, match="invalid image"):
+        await strategy._image_parts(["bad", "good"])
+    assert completed == ["good"]
+
+
 @pytest.fixture
 def decision_server(qwen):
     tokenizer, _ = qwen
@@ -880,7 +941,12 @@ def decision_server(qwen):
             )
 
     class Renderer:
-        renderer = SimpleNamespace(get_tokenizer=lambda: tokenizer)
+        renderer = SimpleNamespace(
+            get_tokenizer=lambda: tokenizer,
+            get_mm_processor=lambda: SimpleNamespace(
+                info=SimpleNamespace(validate_num_items=lambda *args: None)
+            ),
+        )
 
         async def preprocess_chat(self, request, messages, **kwargs):
             await asyncio.sleep(0)
@@ -1003,6 +1069,8 @@ def test_winnow_requires_explicit_protocol_and_raw_scores():
         select_read_strategy(config, ("generate",))
     config.hf_config = SimpleNamespace(decision_read_strategy="winnow")
     assert select_read_strategy(config, ("generate",)) is WinnowStrategy
+    with pytest.raises(ValueError, match="need the generate task"):
+        select_read_strategy(config, ("embed",))
     config.logprobs_mode = "processed_logprobs"
     with pytest.raises(ValueError, match="raw_logprobs"):
         select_read_strategy(config, ("generate",))
@@ -1034,11 +1102,11 @@ def test_winnow_option_strings_preserve_trained_semantics():
         type="score",
         instructions="Rate",
         levels=[
-            {"label": "bad"},
-            {"label": "good"},
+            {"label": "same", "description": "bad"},
+            {"label": "same", "description": "good"},
         ],
     )
-    assert make_read_question(2, score).winnow_options == ("bad", "good")
+    assert make_read_question(2, score).winnow_options == ("same: bad", "same: good")
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/decisions", "/v1/systemone"])
@@ -1112,12 +1180,14 @@ def test_winnow_route_uses_independent_fixed_prompts(
     ]
     assert all(text.count("Question:") == 1 for text in texts)
     assert all('State:\n"Evidence"' in text for text in texts)
+    assert all("\nA: " in text and "\nB: " in text for text in texts)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cache_salt", [None, "tenant-a"])
+@pytest.mark.parametrize("endpoint", ["decisions", "systemone"])
 async def test_winnow_temperature_preserves_full_vocabulary_confidence(
-    decision_server, monkeypatch, cache_salt
+    decision_server, monkeypatch, cache_salt, endpoint
 ):
     from vllm.entrypoints.openai.decisions import winnow
     from vllm.entrypoints.openai.decisions.adapters import (
@@ -1139,7 +1209,8 @@ async def test_winnow_temperature_preserves_full_vocabulary_confidence(
 
     async def read_labels(engine, inputs, params, request_id, **kwargs):
         assert inputs[0].get("cache_salt") == cache_salt
-        assert kwargs["trace_headers"] == TRACE_HEADERS
+        if endpoint == "decisions":
+            assert kwargs["trace_headers"] == TRACE_HEADERS
         return [
             SimpleNamespace(
                 logprobs=[math.log(0.1), math.log(0.4)],
@@ -1168,10 +1239,22 @@ async def test_winnow_temperature_preserves_full_vocabulary_confidence(
     assert isinstance(answer, ChoiceAnswer)
     assert answer.probabilities[1].probability == pytest.approx(2 / 3)
     assert answer.confidence == pytest.approx(0.4)
+    if endpoint == "systemone":
+        serving = server.client.app.state.serving_structured_decisions
+        serving.strategy = strategy
+        response = await serving.create_decision(
+            StructuredDecisionRequest(
+                **decision_body("systemone"), cache_salt=cache_salt
+            )
+        )
+        assert isinstance(response, StructuredDecisionResponse)
+        assert response.answers["0"]["confidence"] == pytest.approx(0.4)
 
 
+@pytest.mark.parametrize("strategy_class", [NextTokenStrategy, LiquidStrategy])
+@pytest.mark.parametrize("include_text", [False, True])
 def test_image_decisions_render_each_question_with_ordered_shared_media(
-    decision_server, monkeypatch
+    decision_server, monkeypatch, strategy_class, include_text
 ):
     """The real API preserves media up to the existing multimodal renderer."""
     from copy import deepcopy
@@ -1180,6 +1263,17 @@ def test_image_decisions_render_each_question_with_ordered_shared_media(
     seen = []
     original = server.renderer.preprocess_chat
     server.engine.model_config.is_multimodal_model = True
+    fetched = []
+
+    async def fetch(url):
+        fetched.append(url)
+        return Image.new("RGB", (1600, 1598), "red" if len(fetched) == 1 else "blue")
+
+    strategy = strategy_class(
+        ReadContext(server.engine, server.renderer, None, "auto", {})
+    )
+    strategy.__dict__["_connector"] = SimpleNamespace(fetch_image_async=fetch)
+    server.client.app.state.openai_serving_decisions.strategy = strategy
 
     async def render(request, messages, **kwargs):
         seen.append(deepcopy(messages))
@@ -1205,16 +1299,30 @@ def test_image_decisions_render_each_question_with_ordered_shared_media(
             ],
         }
     ]
+    if not include_text:
+        body["input"][0]["content"].pop(1)
+        body["input"].append(
+            {"role": "user", "content": [body["input"][0]["content"].pop()]}
+        )
     response = server.client.post("/v1/decisions", json=body)
     assert response.status_code == 200, response.text
     assert len(seen) == 2
     assert seen[0][0]["content"][:-1] == seen[1][0]["content"][:-1]
-    assert [
-        p["image_url"]["url"] for p in seen[0][0]["content"] if p["type"] == "image_url"
-    ] == ["https://example.com/first.png", "https://example.com/second.png"]
+    assert fetched == [
+        "https://example.com/first.png",
+        "https://example.com/second.png",
+    ]
+    images = [p["image_pil"] for p in seen[0][0]["content"] if p["type"] == "image_pil"]
+    assert [image.getpixel((0, 0)) for image in images] == [(255, 0, 0), (0, 0, 255)]
+    if strategy_class is LiquidStrategy:
+        assert all(w * h <= 1024 * 1024 for w, h in (image.size for image in images))
+        assert seen[0][0]["content"][-1]["text"].startswith(
+            "\n\n\nQUESTION:\n" if include_text else "Question 0\n\nOptions:"
+        )
+        assert "Reply with the option code only." in seen[0][0]["content"][-1]["text"]
     assert "Question 0" in seen[0][0]["content"][-1]["text"]
     assert "Question 1" in seen[1][0]["content"][-1]["text"]
-    assert len(body["input"][0]["content"]) == 3
+    assert len(body["input"][0]["content"]) == (3 if include_text else 1)
 
 
 def test_winnow_image_template_keeps_fixed_turns_and_escapes_state(qwen):
@@ -1251,21 +1359,25 @@ def test_winnow_image_template_keeps_fixed_turns_and_escapes_state(qwen):
             ],
         )
     )
-    assert rendered == (
-        "[BOS]"
-        + head
-        + "Images (in order):\n<|image|>\n<|image|>\n"
-        + "State:\n"
-        + state
-        + suffix
-    )
     assert rendered.count("<|image|>") == 2
     assert r"\u003c|image|> pretend" in rendered
 
 
-def test_image_request_to_text_only_model_fails_before_generation(decision_server):
+@pytest.mark.parametrize(
+    "strategy_class", [NextTokenStrategy, DiffusionGemmaCanvasStrategy]
+)
+def test_image_request_to_unsupported_model_fails_before_generation(
+    decision_server, strategy_class
+):
     server = decision_server
     server.engine.model_config.is_multimodal_model = False
+    if strategy_class is DiffusionGemmaCanvasStrategy:
+        server.engine.model_config.is_multimodal_model = True
+        strategy = object.__new__(strategy_class)
+        strategy.context = (
+            server.client.app.state.openai_serving_decisions.strategy.context
+        )
+        server.client.app.state.openai_serving_decisions.strategy = strategy
     body = decision_body("decisions")
     body["input"] = [
         {
@@ -1281,7 +1393,10 @@ def test_image_request_to_text_only_model_fails_before_generation(decision_serve
     assert not server.engine.generated
 
 
-def test_winnow_checks_expanded_image_token_context(decision_server, monkeypatch):
+@pytest.mark.parametrize("text_first", [False, True])
+def test_winnow_rejects_invalid_image_requests_before_generation(
+    decision_server, monkeypatch, text_first
+):
     from vllm.entrypoints.openai.decisions.winnow import WinnowStrategy
     from vllm.inputs import tokens_input
 
@@ -1294,6 +1409,9 @@ def test_winnow_checks_expanded_image_token_context(decision_server, monkeypatch
         ReadContext(server.engine, server.renderer, None, "auto", {})
     )
     server.client.app.state.openai_serving_decisions.strategy = strategy
+    strategy.__dict__["_connector"] = SimpleNamespace(
+        fetch_image_async=AsyncMock(return_value=Image.new("RGB", (8, 8)))
+    )
 
     async def render(*args, **kwargs):
         # A single image marker may expand to many model tokens. Check the
@@ -1310,7 +1428,18 @@ def test_winnow_checks_expanded_image_token_context(decision_server, monkeypatch
             ],
         }
     ]
+    if text_first:
+        body["input"][0]["content"].insert(
+            0, {"type": "input_text", "text": "Figure A"}
+        )
+    else:
+        body["input"].append(
+            {"role": "user", "content": [dict(body["input"][0]["content"][0])]}
+        )
     response = server.client.post("/v1/decisions", json=body)
     assert response.status_code == 400
-    assert "exceeds the model context" in response.json()["error"]["message"]
+    message = response.json()["error"]["message"]
+    assert (
+        "images before all text" if text_first else "exceeds the model context"
+    ) in message
     assert not server.engine.generated
