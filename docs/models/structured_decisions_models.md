@@ -189,13 +189,16 @@ rescales and normalizes pixels on the host.
 
 #### Box questions
 
-On Qwen3.5 vision generation models, `/v1/systemone` also accepts `box`
-questions to locate one target. Supply exactly one image for the request and
-describe the target in `instructions`; Box questions take no `criteria`.
+On D3 decision models and multimodal models using the next-token generation
+strategy, `/v1/systemone` also accepts `box` questions to locate one target.
+There is no Box architecture allowlist; choose a model that can localize targets.
+Supply exactly one image and describe the target in `instructions`;
+Box questions take no `criteria`.
+Use a noun phrase such as `the leftmost bottle` to identify the target.
 
 ```json
 {
-  "model": "Qwen/Qwen3.5-4B",
+  "model": "vllm-sr/d3-flash",
   "state": "Inspect the attached image.",
   "images": ["https://example.org/photo.png"],
   "questions": {
@@ -210,21 +213,43 @@ A Box answer contains `type: "box"`, `box: {left, top, right, bottom}` and
 the top-left corner, with `left < right` and `top < bottom`. Multiply horizontal
 edges by image width and vertical edges by image height to draw the rectangle.
 
-Box uses constrained coordinate generation, with up to 128 output tokens per
-question. The prompt must leave room for all 128 tokens in the model context.
-It can be mixed with ordinary questions, retaining question order
-and sharing the same image. Image placement follows the model's native
-processor. Box does not emit label diagnostics, and unsupported strategies,
+Box can be mixed with ordinary questions, retaining question order and sharing
+the same image. Box does not emit label diagnostics, and unsupported strategies,
 missing images or multiple images return 400. Invalid model coordinates return
 a generation error rather than a repaired or fabricated box.
 
-Use `--logprobs-mode raw_logprobs`. Box `confidence` is the geometric mean of
+D3 locates the target with yes/no classification reads: one presence question,
+then four rounds of a 4 × 4 grid. Each cell is outlined in red on a separate
+copy of the image and scored for intersection with the target. Positive cells
+form a box; the next round reads an enlarged crop of that box. Each view is
+limited to 512² pixels. A box takes 65 reads, with up to 16 concurrent cell
+reads. D3 accepts at most four Box questions per request, running them serially
+(up to 260 classifier reads). All subquestion input tokens
+count in `usage`, while `output_tokens` is zero. Keep `state` short because
+each subquestion repeats it. A round with no positive cells retains the previous
+box estimate. D3 Box does not take videos.
+
+D3 Box `confidence` combines the presence probability with the last grid's
+cell scores. It is uncalibrated and does not estimate IoU. An absent target
+still receives a box with low confidence; ask a separate `noul` question to
+check presence. The cell boundaries limit localization: a target intersecting
+every cell retains the full crop, even when its edges lie inside that crop.
+This implementation follows the grid-search approach described
+in the [Decision API docs](https://decision.vllm-sr.ai/docs#box); it does not
+reproduce the hosted service's fitted confidence formula or claim its accuracy.
+The [Decision Box gallery](https://huggingface.co/spaces/vllm-sr/Decision-Box)
+shows examples, with additional tiling and edge checks in its
+[source](https://huggingface.co/spaces/vllm-sr/Decision-Box/blob/main/app.js).
+
+Generation strategies use constrained coordinate generation, with up to 128
+output tokens per question. The prompt must leave room for all 128 tokens in the model
+context. Use `--logprobs-mode raw_logprobs`. Its Box `confidence` is the geometric mean of
 the generated-token probabilities reported by the engine under its decoding
 constraints. It is an uncalibrated decoding-likelihood measure; it does not
 estimate box overlap or object presence. Check presence with a separate `noul`
 question when the target might be absent. Validate localization on your images.
 Box is a `/v1/systemone` extension; `/v1/decisions` retains its existing question
-types. D3, Winnow, Liquid and DiffusionGemma do not support this Box read path.
+types. Other classifier strategies currently have no Box execution path.
 
 ### OpenAI Decisions API
 

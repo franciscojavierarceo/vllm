@@ -24,6 +24,11 @@ from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.generate.structured_decisions.api_router import (
     register_structured_decisions_api_router,
 )
+from vllm.entrypoints.generate.structured_decisions.box import BoxQuestion
+from vllm.entrypoints.generate.structured_decisions.d3_box import (
+    grid_box,
+    read_d3_boxes,
+)
 from vllm.entrypoints.generate.structured_decisions.protocol import (
     StructuredDecisionRequest,
     StructuredDecisionResponse,
@@ -48,6 +53,7 @@ from vllm.entrypoints.openai.decisions.strategies import (
     JointSchemaStrategy,
     LiquidStrategy,
     NextTokenStrategy,
+    QuestionRead,
     ReadContext,
     cap_pixels,
     reply_label_ids,
@@ -64,6 +70,7 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.inputs import mm_input, tokens_input
 from vllm.logprobs import Logprob
 from vllm.multimodal.media import MediaConnector, MediaWithBytes
+from vllm.multimodal.utils import encode_image_url
 from vllm.outputs import (
     CompletionOutput,
     PoolingOutput,
@@ -791,6 +798,282 @@ async def test_d3_rejects_instructions(d3):
     engine.encode.assert_not_called()
 
 
+@pytest.mark.parametrize("size", [(101, 51), (1, 1), (2, 3)])
+def test_d3_grid_box_encloses_selected_cells_even_on_tiny_images(size):
+    width, height = size
+    for cell in range(16):
+        scores = [0.1] * 16
+        scores[cell] = 0.9
+        left, top, right, bottom = grid_box(scores, width, height)
+        row, col = divmod(cell, 4)
+        assert 0 <= left < right <= width
+        assert 0 <= top < bottom <= height
+        assert left <= col * width / 4 < right
+        assert top <= row * height / 4 < bottom
+    assert grid_box([0.1] * 16, width, height) == (0, 0, width, height)
+    assert grid_box([0.9] * 16, width, height) == (0, 0, width, height)
+
+
+@pytest.fixture
+def d3_box_server(d3, monkeypatch):
+    handler, engine, _ = d3
+    image = Image.new("RGB", (100, 50), "blue")
+    fetch = AsyncMock(return_value=image)
+    strategy = handler.strategy
+    strategy.__dict__["_connector"] = SimpleNamespace(fetch_image_async=fetch)
+    monkeypatch.setattr(
+        strategy.context.online_renderer.renderer,
+        "get_mm_processor",
+        lambda: SimpleNamespace(
+            info=SimpleNamespace(validate_num_items=lambda *a: None)
+        ),
+    )
+    calls = []
+    active = peak = 0
+
+    async def read(questions, instructions, state, **kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        calls.append((questions, instructions, state, kwargs))
+        cell = kwargs["request_id"].rsplit("-cell-", 1)
+        probability = 0.9 if len(cell) == 1 or int(cell[1]) == 6 else 0.1
+        return [QuestionRead([probability, 1 - probability], 1.0, True, 11, 0)]
+
+    monkeypatch.setattr(strategy, "read", read)
+    app = FastAPI()
+    app.state.args = SimpleNamespace(log_error_stack=False)
+    app.state.serving_structured_decisions = handler
+    init_exception_handler(app)
+    register_structured_decisions_api_router(app)
+    with TestClient(app) as client:
+        yield SimpleNamespace(
+            client=client,
+            engine=engine,
+            calls=calls,
+            fetch=fetch,
+            image=image,
+            peak=lambda: peak,
+        )
+
+
+def test_d3_boxes_use_bounded_classification_reads_and_preserve_mixed_answers(
+    d3_box_server,
+):
+    server = d3_box_server
+    body = box_body()
+    body.update(model=D3_REQUEST["model"], cache_salt="tenant-a", priority=7)
+    body["questions"].update(
+        present={"type": "noul", "instructions": "Is the target visible?"},
+        second={"type": "box", "instructions": "the blue circle"},
+    )
+    response = server.client.post("/v1/systemone", json=body, headers=TRACE_HEADERS)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert list(result["answers"]) == ["target", "present", "second"]
+    assert result["answers"]["present"]["noul"] == pytest.approx(0.9)
+    for name in ("target", "second"):
+        answer = result["answers"][name]
+        box = answer["box"]
+        assert box == pytest.approx(
+            {"left": 0.68, "top": 0.28, "right": 0.7, "bottom": 0.32}
+        )
+        assert answer["confidence"] == pytest.approx(0.81)
+    assert result["usage"] == {"input_tokens": 131 * 11, "output_tokens": 0}
+    assert list(result["diagnostics"]) == ["present"]
+    assert len(server.calls) == len({c[3]["request_id"] for c in server.calls}) == 131
+    assert server.peak() == 16
+    server.engine.check_admission.assert_called_once_with(16)
+    server.engine.generate.assert_not_called()
+    server.fetch.assert_awaited_once()
+    assert server.image.tobytes() == bytes((0, 0, 255)) * 5000
+    for _, instructions, state, kwargs in server.calls:
+        assert instructions is None and state == body["state"]
+        assert kwargs["cache_salt"] == "tenant-a"
+        assert kwargs["priority"] == 7
+        assert kwargs["trace_headers"] == TRACE_HEADERS
+
+
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"images": []}, "exactly one image"),
+        ({"images": ["one", "two"]}, "exactly one image"),
+        ({"videos": ["clip"]}, "do not take videos"),
+        ({"instructions": "Be strict."}, "fixed prompt"),
+    ],
+)
+def test_invalid_d3_box_requests_fail_before_any_inference(
+    d3_box_server, change, message
+):
+    server = d3_box_server
+    body = {**box_body(), "model": D3_REQUEST["model"], **change}
+    response = server.client.post("/v1/systemone", json=body)
+    assert response.status_code == 400, response.text
+    assert message in response.json()["error"]["message"]
+    server.fetch.assert_not_awaited()
+    assert not server.calls
+
+
+@pytest.mark.parametrize("count,status", [(4, 200), (5, 400)])
+def test_d3_box_work_limit_is_checked_before_fetching(d3_box_server, count, status):
+    server = d3_box_server
+    body = {**box_body(), "model": D3_REQUEST["model"]}
+    body["questions"] = {
+        str(i): {"type": "box", "instructions": "the mug"} for i in range(count)
+    }
+    response = server.client.post("/v1/systemone", json=body)
+    assert response.status_code == status, response.text
+    if status == 400:
+        assert "at most 4 Box questions" in response.json()["error"]["message"]
+        server.fetch.assert_not_awaited()
+        server.engine.check_admission.assert_not_called()
+        assert not server.calls
+    else:
+        assert len(server.calls) == 260
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty_later_rounds", [False, True])
+async def test_d3_box_reads_real_data_urls_and_preserves_label_prompts(
+    d3, monkeypatch, empty_later_rounds
+):
+    handler, engine, tokenizer = d3
+    strategy = handler.strategy
+    strategy.__dict__["_connector"] = MediaConnector()
+    renderer = strategy.context.online_renderer.renderer
+    monkeypatch.setattr(
+        renderer,
+        "get_mm_processor",
+        lambda: SimpleNamespace(
+            info=SimpleNamespace(validate_num_items=lambda *a: None)
+        ),
+    )
+    # The fixture's text tokenizer needs the vision placeholder convention.
+    apply_template = tokenizer.apply_chat_template
+
+    def vision_template(messages, **kwargs):
+        messages = [dict(message) for message in messages]
+        content = messages[1]["content"]
+        if isinstance(content, list):
+            messages[1]["content"] = (
+                "<|vision_start|><|image_pad|><|vision_end|>" + content[-1]["text"]
+            )
+        return apply_template(messages, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "apply_chat_template", vision_template)
+    images = []
+
+    async def process(prompt, arrival_time):
+        images.extend(prompt["multi_modal_data"]["image"])
+        # Stand in for the processor's expansion of the media placeholder.
+        return mm_input(
+            prompt["prompt_token_ids"] + [42, 42],
+            {},
+            {},
+            {},
+            cache_salt=prompt.get("cache_salt"),
+        )
+
+    monkeypatch.setattr(renderer, "process_for_engine_async", process)
+
+    async def encode(prompt, params, request_id, **kwargs):
+        text = tokenizer.decode(prompt["prompt_token_ids"])
+        assert "Options:\nA: No / false\nB: Yes / true\n" in text
+        cell = request_id.rsplit("-cell-", 1)
+        positive = len(cell) == 1 or (
+            cell[1] == "6-0" and (not empty_later_rounds or "round-0-" in request_id)
+        )
+        probs = [0.1, 0.9] if positive else [0.9, 0.1]
+        logits = D3_TEMPERATURE * torch.tensor(probs).log()
+        yield PoolingRequestOutput(
+            request_id, PoolingOutput(logits), prompt["prompt_token_ids"], 0, True
+        )
+
+    engine.encode.side_effect = encode
+    body = {**box_body(), "model": D3_REQUEST["model"], "cache_salt": "tenant-a"}
+    body["images"] = [encode_image_url(Image.new("RGB", (100, 50), "blue"))]
+    target = body["questions"].pop("target")
+    body["questions"]["present"] = {"type": "noul", "instructions": "Is it visible?"}
+    before = await handler.create_decision(StructuredDecisionRequest(**body))
+    label_prompt = engine.encode.call_args.args[0]
+    engine.encode.reset_mock()
+    images.clear()
+    body["questions"]["target"] = target
+    response = await handler.create_decision(StructuredDecisionRequest(**body))
+    assert isinstance(response, StructuredDecisionResponse)
+    assert response.answers["present"] == before.answers["present"]
+    assert engine.encode.call_args_list[0].args[0] == label_prompt
+    assert engine.encode.call_count == len(images) == 66
+    assert response.answers["target"]["box"] == pytest.approx(
+        {"left": 0.5, "top": 0.24, "right": 0.75, "bottom": 0.5}
+        if empty_later_rounds
+        else {"left": 0.68, "top": 0.28, "right": 0.7, "bottom": 0.32}
+    )
+    assert response.answers["target"]["confidence"] == pytest.approx(
+        0.09 if empty_later_rounds else 0.81
+    )
+    assert images[0].getpixel((50, 12)) == (0, 0, 255)
+    assert any(image.getpixel((50, 12)) == (255, 0, 0) for image in images[2:18])
+    prompts = [call.args[0] for call in engine.encode.call_args_list]
+    assert all(p["cache_salt"] == "tenant-a" for p in prompts)
+    assert response.usage.input_tokens == sum(
+        len(p["prompt_token_ids"]) for p in prompts
+    )
+    assert response.usage.output_tokens == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_request", [False, True])
+async def test_d3_grid_drains_siblings_when_a_cell_or_request_fails(
+    d3, monkeypatch, cancel_request
+):
+    handler, _, _ = d3
+    active = set()
+    started = set()
+    all_started = asyncio.Event()
+
+    async def read(questions, instructions, state, **kwargs):
+        request_id = kwargs["request_id"]
+        if request_id.endswith("presence"):
+            return [QuestionRead([0.9, 0.1], 1.0, True, 11, 0)]
+        active.add(request_id)
+        started.add(request_id)
+        if len(started) == 16:
+            all_started.set()
+        try:
+            if request_id.endswith("cell-0") and not cancel_request:
+                await all_started.wait()
+                raise ValueError("cell failed")
+            await asyncio.Future()
+        finally:
+            active.remove(request_id)
+
+    monkeypatch.setattr(handler.strategy, "read", read)
+    task = asyncio.create_task(
+        read_d3_boxes(
+            handler.strategy,
+            [BoxQuestion("target", "the mug")],
+            Image.new("RGB", (8, 8)),
+            "A photo.",
+            request_id="test",
+            chat_template_kwargs=None,
+            lora_request=None,
+            priority=0,
+            cache_salt=None,
+            trace_headers=None,
+        )
+    )
+    await asyncio.wait_for(all_started.wait(), timeout=5)
+    if cancel_request:
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError if cancel_request else ValueError):
+        await asyncio.wait_for(task, timeout=5)
+    assert not active
+
+
 @pytest.mark.parametrize(
     "type_name,criteria,ask",
     [
@@ -1512,7 +1795,7 @@ def test_boxes_and_decisions_share_one_image_and_keep_question_order(box_server)
         ({"images": ["one", "two"]}, "exactly one image"),
         ({"criteria": {}}, "do not take criteria"),
         ({"instructions": " "}, "target instructions"),
-        ({"architecture": "Qwen3ForCausalLM"}, "Qwen3.5 vision"),
+        ({"is_multimodal_model": False}, "multimodal generation strategy"),
         ({"logprobs_mode": "processed_logprobs"}, "raw_logprobs"),
         ({"chat_template_kwargs": {"enable_thinking": True}}, "thinking must be off"),
     ],
@@ -1525,7 +1808,7 @@ def test_invalid_box_requests_fail_before_download_or_generation(
     for key, value in change.items():
         if key in {"criteria", "instructions"}:
             body["questions"]["target"][key] = value
-        elif key in {"architecture", "logprobs_mode"}:
+        elif key in {"is_multimodal_model", "logprobs_mode"}:
             setattr(server.engine.model_config, key, value)
         else:
             body[key] = value
@@ -1534,6 +1817,26 @@ def test_invalid_box_requests_fail_before_download_or_generation(
     assert message in response.json()["error"]["message"]
     assert not server.engine.generated
     server.fetch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("architecture", ["Qwen3ForCausalLM", "FutureVisionModel"])
+@pytest.mark.parametrize("strategy_class", [NextTokenStrategy, LiquidStrategy])
+def test_box_generation_does_not_require_a_known_architecture(
+    box_server, monkeypatch, architecture, strategy_class
+):
+    server = box_server
+    server.engine.model_config.architecture = architecture
+    strategy = server.client.app.state.serving_structured_decisions.strategy
+    monkeypatch.setattr(strategy, "__class__", strategy_class)
+    response = server.client.post("/v1/systemone", json=box_body())
+    assert response.status_code == 200, response.text
+    assert response.json()["answers"]["target"]["box"] == {
+        "left": 0.1,
+        "top": 0.2,
+        "right": 0.7,
+        "bottom": 0.9,
+    }
+    assert len(server.engine.generated) == 1
 
 
 @pytest.mark.parametrize(

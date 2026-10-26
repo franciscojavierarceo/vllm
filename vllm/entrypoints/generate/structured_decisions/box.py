@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from vllm.entrypoints.openai.decisions.question_types import StructuredDecisionError
 from vllm.entrypoints.openai.decisions.strategies import (
+    D3Strategy,
     NextTokenStrategy,
     ReadPromptRequest,
     ReadStrategy,
@@ -57,19 +58,17 @@ class BoxPrediction(BaseModel):
         return self
 
 
-def box_strategy(strategy: ReadStrategy, images: list[str]) -> NextTokenStrategy:
+def box_strategy(
+    strategy: ReadStrategy, images: list[str]
+) -> NextTokenStrategy | D3Strategy:
+    if isinstance(strategy, D3Strategy):
+        if len(images) != 1:
+            raise StructuredDecisionError("Box questions require exactly one image")
+        return strategy
     config = strategy.context.engine_client.model_config
-    if (
-        type(strategy) is not NextTokenStrategy
-        or config.architecture
-        not in {
-            "Qwen3_5ForConditionalGeneration",
-            "Qwen3_5MoeForConditionalGeneration",
-        }
-        or not config.is_multimodal_model
-    ):
+    if not isinstance(strategy, NextTokenStrategy) or not config.is_multimodal_model:
         raise StructuredDecisionError(
-            "Box questions require a Qwen3.5 vision generation model"
+            "Box questions require a D3 classifier or a multimodal generation strategy"
         )
     if len(images) != 1:
         raise StructuredDecisionError("Box questions require exactly one image")

@@ -11,11 +11,17 @@ from vllm.entrypoints.openai.decisions.question_types import (
     build_question,
 )
 from vllm.entrypoints.openai.decisions.serving import BaseServingDecisions
-from vllm.entrypoints.openai.decisions.strategies import DecisionLimits
+from vllm.entrypoints.openai.decisions.strategies import (
+    D3Strategy,
+    DecisionLimits,
+    NextTokenStrategy,
+)
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.inputs import EngineInput
+from vllm.multimodal.utils import encode_image_url
 
 from .box import BoxQuestion, box_strategy, read_boxes, render_boxes
+from .d3_box import GRID_READS, MAX_BOX_QUESTIONS, read_d3_boxes
 from .protocol import (
     DecisionUsage,
     QuestionDiagnostics,
@@ -100,16 +106,31 @@ class ServingStructuredDecisions(BaseServingDecisions):
             grounding = (
                 box_strategy(self.strategy, request.images or []) if boxes else None
             )
+            if isinstance(grounding, D3Strategy):
+                if len(boxes) > MAX_BOX_QUESTIONS:
+                    raise StructuredDecisionError(
+                        f"D3 takes at most {MAX_BOX_QUESTIONS} Box questions "
+                        "per request"
+                    )
+                if request.instructions:
+                    raise StructuredDecisionError(
+                        "this model reads a fixed prompt, so it takes no instructions"
+                    )
+                if request.videos:
+                    raise StructuredDecisionError("D3 Box questions do not take videos")
             box_request = (
                 grounding._read_request(
                     request.chat_template_kwargs, request.cache_salt
                 )
-                if grounding is not None
+                if isinstance(grounding, NextTokenStrategy)
                 else None
             )
             lora_request = self._maybe_get_adapters(request)  # type: ignore[arg-type]
+            label_requests = self.strategy.num_requests(labels) if labels else 0
             engine_client.check_admission(
-                (self.strategy.num_requests(labels) if labels else 0) + len(boxes)
+                max(label_requests, GRID_READS)
+                if isinstance(grounding, D3Strategy)
+                else label_requests + len(boxes)
             )
             trace_headers = (
                 None
@@ -120,7 +141,7 @@ class ServingStructuredDecisions(BaseServingDecisions):
                 request.state
             )
             box_inputs: list[EngineInput] = []
-            if grounding is not None:
+            if isinstance(grounding, NextTokenStrategy):
                 assert box_request is not None
                 images = await grounding._image_parts(request.images or [])
                 state = [
@@ -133,6 +154,14 @@ class ServingStructuredDecisions(BaseServingDecisions):
                     grounding, boxes, state, request.instructions, box_request
                 )
                 media = {}
+            d3_image = None
+            if isinstance(grounding, D3Strategy):
+                images = await grounding._image_parts(request.images or [])
+                d3_image = images[0]["image_pil"]
+                if labels:
+                    media = {
+                        "image": [await asyncio.to_thread(encode_image_url, d3_image)]
+                    }
             reads = (
                 await self.strategy.read(
                     labels,
@@ -149,8 +178,23 @@ class ServingStructuredDecisions(BaseServingDecisions):
                 if labels
                 else []
             )
-            box_reads = (
-                await read_boxes(
+            box_reads = []
+            if isinstance(grounding, D3Strategy):
+                assert d3_image is not None and isinstance(state, str)
+                box_reads = await read_d3_boxes(
+                    grounding,
+                    boxes,
+                    d3_image,
+                    state,
+                    request_id=request_id,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    lora_request=lora_request,
+                    priority=request.priority,
+                    cache_salt=request.cache_salt,
+                    trace_headers=trace_headers,
+                )
+            elif isinstance(grounding, NextTokenStrategy):
+                box_reads = await read_boxes(
                     grounding,
                     boxes,
                     box_inputs,
@@ -159,9 +203,6 @@ class ServingStructuredDecisions(BaseServingDecisions):
                     priority=request.priority,
                     trace_headers=trace_headers,
                 )
-                if grounding is not None
-                else []
-            )
         except StructuredDecisionError as e:
             return self.create_error_response(e)
         except asyncio.CancelledError:
